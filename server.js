@@ -108,7 +108,7 @@ function startServer() {
   const qWork = db.prepare("SELECT * FROM works WHERE key = ?");
   const qFts = db.prepare(
     "SELECT w.* FROM works w WHERE w.id IN " +
-    "(SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY rank LIMIT 250) " +
+    "(SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY rank LIMIT 600) " +
     "ORDER BY w.ecount DESC LIMIT ?");
   const qLike = db.prepare(
     "SELECT * FROM works WHERE title LIKE ? ORDER BY ecount DESC LIMIT ?");
@@ -167,26 +167,30 @@ function startServer() {
   }
 
   async function fetchGut(id) {
-    const urls = [
-      GUT_BASE + "/cache/epub/" + id + "/pg" + id + ".txt", // regenerated UTF-8, exists for every book
-      GUT_BASE + "/files/" + id + "/" + id + "-0.txt",      // legacy UTF-8
-      GUT_BASE + "/files/" + id + "/" + id + ".txt",        // legacy ASCII
+    // Prefer the HTML edition (it carries the book's actual illustrations);
+    // fall back to plaintext, which gets its boilerplate stripped.
+    const tries = [
+      { kind: "html", url: GUT_BASE + "/cache/epub/" + id + "/pg" + id + "-images.html" },
+      { kind: "html", url: GUT_BASE + "/cache/epub/" + id + "/pg" + id + ".html" },
+      { kind: "text", url: GUT_BASE + "/cache/epub/" + id + "/pg" + id + ".txt" },
+      { kind: "text", url: GUT_BASE + "/files/" + id + "/" + id + "-0.txt" },
+      { kind: "text", url: GUT_BASE + "/files/" + id + "/" + id + ".txt" },
     ];
     let lastErr = "unreachable";
-    for (const u of urls) {
+    for (const t of tries) {
       const ctl = new AbortController();
       const tm = setTimeout(() => ctl.abort(), 30000);
       try {
-        const r = await fetch(u, {
+        const r = await fetch(t.url, {
           signal: ctl.signal,
           headers: { "User-Agent": "HexadecagonLibrary/1.0 (+https://github.com/cyphercryptgas/stacks-catalog)" },
         });
-        if (!r.ok) { lastErr = "HTTP " + r.status + " " + u; continue; }
+        if (!r.ok) { lastErr = "HTTP " + r.status + " " + t.url; continue; }
         const buf = Buffer.from(await r.arrayBuffer());
         if (buf.length > GUT_MAX) { lastErr = "text too large"; continue; }
-        const text = stripPG(buf.toString("utf8"));
-        if (text.length < 200) { lastErr = "text empty after trimming boilerplate"; continue; }
-        return text;
+        const body = t.kind === "text" ? stripPG(buf.toString("utf8")) : buf.toString("utf8");
+        if (body.length < 200) { lastErr = "empty after trimming"; continue; }
+        return { kind: t.kind, body };
       } catch (e) {
         lastErr = e && e.name === "AbortError" ? "timeout" : (e.message || "fetch failed");
       } finally { clearTimeout(tm); }
@@ -195,28 +199,32 @@ function startServer() {
   }
 
   function gutenbergRoute(id, res) {
-    const file = path.join(TEXTS_DIR, id + ".txt");
-    const serve = (body) => {
+    const fHtml = path.join(TEXTS_DIR, id + ".html");
+    const fText = path.join(TEXTS_DIR, id + ".txt");
+    const serve = (kind, body) => {
       res.writeHead(200, {
-        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Type": (kind === "html" ? "text/html" : "text/plain") + "; charset=utf-8",
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=31536000, immutable",
       });
       res.end(body);
     };
-    if (fs.existsSync(file)) return serve(fs.readFileSync(file));
+    if (fs.existsSync(fHtml)) return serve("html", fs.readFileSync(fHtml));
+    if (fs.existsSync(fText)) return serve("text", fs.readFileSync(fText));
     let p = gutInflight.get(id);
     if (!p) {
-      p = fetchGut(id).then((text) => {
+      p = fetchGut(id).then((got) => {
         fs.mkdirSync(TEXTS_DIR, { recursive: true });
-        fs.writeFileSync(file + ".tmp." + process.pid, text);
+        const file = got.kind === "html" ? fHtml : fText;
+        fs.writeFileSync(file + ".tmp." + process.pid, got.body);
         fs.renameSync(file + ".tmp." + process.pid, file);
-        console.log("gutenberg " + id + " cached (" + (text.length / 1024).toFixed(0) + " KB)");
-        return text;
+        console.log("gutenberg " + id + " cached as " + got.kind + " (" + (got.body.length / 1024).toFixed(0) + " KB)");
+        return got;
       }).finally(() => gutInflight.delete(id));
       gutInflight.set(id, p);
     }
-    p.then(serve).catch((e) => send(res, 502, { error: "gutenberg fetch failed: " + e.message }, true));
+    p.then((got) => serve(got.kind, got.body))
+      .catch((e) => send(res, 502, { error: "gutenberg fetch failed: " + e.message }, true));
   }
 
   const routes = {
