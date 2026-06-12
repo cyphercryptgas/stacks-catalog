@@ -227,7 +227,175 @@ function startServer() {
       .catch((e) => send(res, 502, { error: "gutenberg fetch failed: " + e.message }, true));
   }
 
+  // ---- Plateau 3: LibriVox audiobooks + Project Gutenberg catalog cross-reference ----
+  const LV_BASE = (process.env.LIBRIVOX_BASE || "https://librivox.org").replace(/\/+$/, "");
+  const AUDIO_DIR = path.join(DATA_DIR, "audio");
+  const UA = { "User-Agent": "HexadecagonLibrary/1.0 (+https://github.com/cyphercryptgas/stacks-catalog)" };
+
+  const normTitle = (s) => String(s || "").toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\b(the|a|an|or|and)\b/g, " ")
+    .replace(/\s+/g, " ").trim();
+  const surname = (a) => {
+    const w = String(a || "").trim().split(/\s+/);
+    return w.length ? w[w.length - 1].toLowerCase().replace(/[^a-z]/g, "") : "";
+  };
+  const slugOf = (title, author) =>
+    (normTitle(title) + "-" + surname(author)).replace(/[^a-z0-9-]+/g, "-").slice(0, 80);
+
+  async function jfetch(url, ms) {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), ms || 20000);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, headers: UA });
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+      return await r.json();
+    } finally { clearTimeout(tm); }
+  }
+
+  async function lvLookup(title, author) {
+    const j = await jfetch(LV_BASE + "/api/feed/audiobooks/?format=json&extended=1&limit=25&title=" +
+      encodeURIComponent(title), 25000);
+    let books = (j && j.books) || [];
+    if (!Array.isArray(books)) books = [];
+    const nt = normTitle(title), sn = surname(author);
+    const scored = [];
+    for (const b of books) {
+      if (b.language && !/english/i.test(b.language)) continue;
+      const bt = normTitle(b.title);
+      let score = bt === nt ? 3 : (bt.startsWith(nt) || nt.startsWith(bt)) ? 2 :
+        (bt.includes(nt) || nt.includes(bt)) ? 1 : 0;
+      if (!score) continue;
+      if (sn) {
+        const auths = (b.authors || [])
+          .map((a) => ((a.last_name || "") + " " + (a.first_name || "")).toLowerCase()).join(" | ");
+        if (!auths.includes(sn)) continue; // wrong author entirely — skip
+        score += 2;
+      }
+      scored.push({ b, score });
+    }
+    scored.sort((x, y) => y.score - x.score ||
+      (Number(y.b.num_sections) || 0) - (Number(x.b.num_sections) || 0));
+    if (!scored.length) return { found: false };
+    const b = scored[0].b;
+    let secs = Array.isArray(b.sections) ? b.sections : [];
+    if (!secs.length && b.id) { // some feeds omit sections; the audiotracks feed has them
+      try {
+        const t = await jfetch(LV_BASE + "/api/feed/audiotracks/?format=json&project_id=" + b.id, 20000);
+        secs = (t && (t.sections || t.audiotracks)) || [];
+      } catch (e) {}
+    }
+    const sections = secs.filter((s) => s && s.listen_url).slice(0, 300).map((s, i) => ({
+      n: Number(s.section_number) || i + 1,
+      title: s.title || ("Section " + (i + 1)),
+      url: s.listen_url,
+      playtime: s.playtime || null,
+    }));
+    return {
+      found: true, id: b.id, title: b.title,
+      author: (b.authors && b.authors[0])
+        ? ((b.authors[0].first_name || "") + " " + (b.authors[0].last_name || "")).trim() : null,
+      totaltime: b.totaltime || null,
+      url: b.url_librivox || null,
+      sections,
+    };
+  }
+
+  const lvInflight = new Map();
+  function audioRoute(q, res) {
+    const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
+    const author = String(q.searchParams.get("author") || "").slice(0, 120).trim();
+    if (title.length < 2) return send(res, 400, { error: "title required" }, true);
+    const slug = slugOf(title, author);
+    const file = path.join(AUDIO_DIR, "lv-" + slug + ".json");
+    if (fs.existsSync(file)) {
+      try { return send(res, 200, JSON.parse(fs.readFileSync(file, "utf8"))); } catch (e) {}
+    }
+    let p = lvInflight.get(slug);
+    if (!p) {
+      p = lvLookup(title, author).then((out) => {
+        fs.mkdirSync(AUDIO_DIR, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(out));
+        if (out.found) console.log("librivox: \"" + title + "\" -> #" + out.id +
+          " (" + out.sections.length + " sections)");
+        return out;
+      }).finally(() => lvInflight.delete(slug));
+      lvInflight.set(slug, p);
+    }
+    p.then((out) => send(res, 200, out))
+      .catch((e) => send(res, 502, { error: "librivox lookup failed: " + e.message }, true));
+  }
+
+  // Project Gutenberg's own catalog (CSV, ~75k rows) — loaded lazily, kept in memory.
+  // Fills the gaps where Open Library's data lacks the gutenberg link.
+  let pgCatalog = null, pgLoading = null;
+  function parseCSV(text) {
+    const rows = []; let row = [], field = "", inQ = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQ) {
+        if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+        else field += c;
+      } else if (c === '"') inQ = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\n") { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
+      else field += c;
+    }
+    if (field !== "" || row.length) { row.push(field.replace(/\r$/, "")); rows.push(row); }
+    return rows;
+  }
+  function loadPgCatalog() {
+    if (pgCatalog) return Promise.resolve(pgCatalog);
+    if (!pgLoading) {
+      pgLoading = (async () => {
+        const ctl = new AbortController();
+        const tm = setTimeout(() => ctl.abort(), 60000);
+        try {
+          const r = await fetch(GUT_BASE + "/cache/epub/feeds/pg_catalog.csv",
+            { signal: ctl.signal, headers: UA });
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const rows = parseCSV(await r.text());
+          const head = rows[0].map((s) => s.toLowerCase());
+          const iId = head.indexOf("text#"), iType = head.indexOf("type"),
+            iTitle = head.indexOf("title"), iLang = head.indexOf("language"),
+            iAuth = head.indexOf("authors");
+          const list = [];
+          for (let i = 1; i < rows.length; i++) {
+            const r2 = rows[i];
+            if ((r2[iType] || "") !== "Text") continue;
+            if (!/(^|;)\s*en\b/.test(r2[iLang] || "")) continue;
+            list.push({ id: Number(r2[iId]), nt: normTitle(r2[iTitle]), au: (r2[iAuth] || "").toLowerCase() });
+          }
+          pgCatalog = list;
+          console.log("pg catalog loaded: " + list.length + " english texts");
+          return list;
+        } finally { clearTimeout(tm); pgLoading = null; }
+      })();
+    }
+    return pgLoading;
+  }
+  async function pgFind(title, author) {
+    const list = await loadPgCatalog();
+    const nt = normTitle(title), sn = surname(author);
+    if (!nt) return { gutenberg: null };
+    const ok = (e) => !sn || e.au.includes(sn);
+    let hits = list.filter((e) => e.nt === nt && ok(e));
+    if (!hits.length) hits = list.filter((e) => e.nt &&
+      (e.nt.startsWith(nt) || nt.startsWith(e.nt)) && ok(e));
+    if (!hits.length) return { gutenberg: null };
+    hits.sort((a, b) => a.id - b.id); // earliest PG number is almost always the canonical text
+    return { gutenberg: hits[0].id };
+  }
+
   const routes = {
+    "/audio/resolve": (q, res) => audioRoute(q, res),
+    "/gutenberg-find": (q, res) => {
+      const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
+      const author = String(q.searchParams.get("author") || "").slice(0, 120).trim();
+      if (title.length < 2) return send(res, 400, { error: "title required" }, true);
+      pgFind(title, author).then((out) => send(res, 200, out))
+        .catch((e) => send(res, 502, { error: "pg catalog lookup failed: " + e.message }, true));
+    },
     "/health": (q, res) => send(res, 200, { ok: true }, true),
     "/version": (q, res) => send(res, 200, {
       version: fs.existsSync(VER_PATH) ? fs.readFileSync(VER_PATH, "utf8").trim() : metaRows.built,
