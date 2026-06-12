@@ -148,6 +148,75 @@ function startServer() {
     res.end(JSON.stringify(obj));
   }
 
+  // ---- Plateau 2: Project Gutenberg full-text proxy ----
+  // Fetches the plaintext once, strips PG boilerplate, caches to disk forever.
+  const GUT_BASE = (process.env.GUTENBERG_BASE || "https://www.gutenberg.org").replace(/\/+$/, "");
+  const TEXTS_DIR = path.join(DATA_DIR, "texts");
+  const GUT_MAX = 10 * 1024 * 1024; // 10 MB of plain text is beyond any single book
+  const gutInflight = new Map();
+
+  function stripPG(t) {
+    t = t.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+    const sm = t.match(/\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK[^\n]*/i);
+    if (sm) t = t.slice(sm.index + sm[0].length);
+    const em = t.match(/\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG EBOOK/i);
+    if (em) t = t.slice(0, em.index);
+    return t.trim() + "\n";
+  }
+
+  async function fetchGut(id) {
+    const urls = [
+      GUT_BASE + "/cache/epub/" + id + "/pg" + id + ".txt", // regenerated UTF-8, exists for every book
+      GUT_BASE + "/files/" + id + "/" + id + "-0.txt",      // legacy UTF-8
+      GUT_BASE + "/files/" + id + "/" + id + ".txt",        // legacy ASCII
+    ];
+    let lastErr = "unreachable";
+    for (const u of urls) {
+      const ctl = new AbortController();
+      const tm = setTimeout(() => ctl.abort(), 30000);
+      try {
+        const r = await fetch(u, {
+          signal: ctl.signal,
+          headers: { "User-Agent": "HexadecagonLibrary/1.0 (+https://github.com/cyphercryptgas/stacks-catalog)" },
+        });
+        if (!r.ok) { lastErr = "HTTP " + r.status + " " + u; continue; }
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length > GUT_MAX) { lastErr = "text too large"; continue; }
+        const text = stripPG(buf.toString("utf8"));
+        if (text.length < 200) { lastErr = "text empty after trimming boilerplate"; continue; }
+        return text;
+      } catch (e) {
+        lastErr = e && e.name === "AbortError" ? "timeout" : (e.message || "fetch failed");
+      } finally { clearTimeout(tm); }
+    }
+    throw new Error(lastErr);
+  }
+
+  function gutenbergRoute(id, res) {
+    const file = path.join(TEXTS_DIR, id + ".txt");
+    const serve = (body) => {
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=31536000, immutable",
+      });
+      res.end(body);
+    };
+    if (fs.existsSync(file)) return serve(fs.readFileSync(file));
+    let p = gutInflight.get(id);
+    if (!p) {
+      p = fetchGut(id).then((text) => {
+        fs.mkdirSync(TEXTS_DIR, { recursive: true });
+        fs.writeFileSync(file + ".tmp." + process.pid, text);
+        fs.renameSync(file + ".tmp." + process.pid, file);
+        console.log("gutenberg " + id + " cached (" + (text.length / 1024).toFixed(0) + " KB)");
+        return text;
+      }).finally(() => gutInflight.delete(id));
+      gutInflight.set(id, p);
+    }
+    p.then(serve).catch((e) => send(res, 502, { error: "gutenberg fetch failed: " + e.message }, true));
+  }
+
   const routes = {
     "/health": (q, res) => send(res, 200, { ok: true }, true),
     "/version": (q, res) => send(res, 200, {
@@ -196,6 +265,8 @@ function startServer() {
       const r = qWork.get("/works/" + m[1].toUpperCase());
       return r ? send(res, 200, doc(r)) : send(res, 404, { error: "not found" });
     }
+    const g = q.pathname.match(/^\/gutenberg\/(\d{1,7})$/);
+    if (g) return gutenbergRoute(g[1], res);
     const h = routes[q.pathname];
     if (h) return h(q, res);
     send(res, 404, { error: "no such route" });
