@@ -1,0 +1,71 @@
+name: Build catalog index
+
+on:
+  workflow_dispatch:
+    inputs:
+      cap:
+        description: "Books kept per subject (depth ceiling = cap/640)"
+        default: "50000"
+  schedule:
+    - cron: "30 4 3 * *"   # 3rd of each month, 04:30 UTC (dumps land at month start)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Build index from Open Library dumps (streamed, never stored)
+        run: |
+          python3 scripts/build_index.py \
+            --editions "https://openlibrary.org/data/ol_dump_editions_latest.txt.gz" \
+            --works    "https://openlibrary.org/data/ol_dump_works_latest.txt.gz" \
+            --authors  "https://openlibrary.org/data/ol_dump_authors_latest.txt.gz" \
+            --out catalog.db \
+            --cap "${{ github.event.inputs.cap || '50000' }}" \
+            --tmp "$RUNNER_TEMP/olidx"
+          ls -la catalog.db
+          df -h /
+
+      - name: Split and compress for release assets (<2GB each)
+        run: |
+          split -b 1900m -d --additional-suffix=.bin catalog.db catalog.part
+          rm catalog.db
+          for f in catalog.part*.bin; do
+            gzip -6 "$f"
+            mv "$f.gz" "${f%.bin}.gz"
+          done
+          VERSION="$(date -u +%Y-%m-%d)"
+          PARTS=$(ls catalog.part*.gz | sort | python3 -c "import json,sys;print(json.dumps([l.strip() for l in sys.stdin]))")
+          python3 - "$VERSION" "$PARTS" <<'EOF'
+          import json, os, sys
+          version, parts = sys.argv[1], json.loads(sys.argv[2])
+          meta = {
+            "version": version,
+            "parts": parts,
+            "bytes": sum(os.path.getsize(p) for p in parts),
+          }
+          open("meta.json", "w").write(json.dumps(meta, indent=2))
+          print(open("meta.json").read())
+          EOF
+          ls -la catalog.part*.gz meta.json
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete catalog-index --cleanup-tag -y || true
+          gh release create catalog-index \
+            --title "Catalog index $(date -u +%Y-%m-%d)" \
+            --notes "Monthly Open Library snapshot. Served by server.js on Railway." \
+            meta.json catalog.part*.gz
