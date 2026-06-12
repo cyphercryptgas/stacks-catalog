@@ -107,7 +107,9 @@ function startServer() {
     "WHERE sr.si = ? AND sr.rank >= ? AND sr.rank < ? ORDER BY sr.rank");
   const qWork = db.prepare("SELECT * FROM works WHERE key = ?");
   const qFts = db.prepare(
-    "SELECT w.* FROM fts JOIN works w ON w.id = fts.rowid WHERE fts MATCH ? ORDER BY rank LIMIT ?");
+    "SELECT w.* FROM works w WHERE w.id IN " +
+    "(SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY rank LIMIT 250) " +
+    "ORDER BY w.ecount DESC LIMIT ?");
   const qLike = db.prepare(
     "SELECT * FROM works WHERE title LIKE ? ORDER BY ecount DESC LIMIT ?");
   const qCount = db.prepare("SELECT COUNT(*) AS n FROM subject_rank WHERE si = ?");
