@@ -20,6 +20,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
 jobs:
   wings:
     runs-on: ubuntu-latest
@@ -34,7 +37,9 @@ jobs:
           python-version: "3.12"
 
       - name: Build research wing (OpenAlex)
+        id: research
         if: ${{ github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research' }}
+        continue-on-error: true
         env:
           PER_FIELD: ${{ inputs.per_field || '10240' }}
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
@@ -42,7 +47,9 @@ jobs:
         run: python scripts/build_wing_research.py
 
       - name: Build law library (CourtListener)
+        id: law
         if: ${{ github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law' }}
+        continue-on-error: true
         env:
           PER_COURT: ${{ inputs.per_court || '2560' }}
           CL_TOKEN: ${{ secrets.CL_TOKEN }}
@@ -57,19 +64,37 @@ jobs:
           python - "$STAMP" <<'PY'
           import gzip, json, os, shutil, sys
           stamp = sys.argv[1]
-          wings = json.load(open("wings.json"))
+          try:
+              wings = json.load(open("wings.json"))
+          except Exception:
+              wings = {}
+          published = []
           for name in ("research", "law"):
               db = name + ".db"
-              if not os.path.exists(db):
+              if not os.path.exists(db) or os.path.getsize(db) < 4096:
+                  print("skip", name, "(no usable db)")
                   continue
               with open(db, "rb") as f, gzip.open(db + ".gz", "wb", compresslevel=6) as g:
                   shutil.copyfileobj(f, g)
               wings[name] = {"asset": db + ".gz", "version": stamp}
+              published.append(name)
               print(name, "->", os.path.getsize(db + ".gz") // 1048576, "MB gz")
           json.dump(wings, open("wings.json", "w"), indent=1)
+          open("published.txt", "w").write(" ".join(published))
           PY
           ASSETS="wings.json"
           [ -f research.db.gz ] && ASSETS="$ASSETS research.db.gz"
           [ -f law.db.gz ] && ASSETS="$ASSETS law.db.gz"
+          if [ "$ASSETS" = "wings.json" ]; then
+            echo "Neither wing built — nothing to publish."; exit 1
+          fi
           gh release upload "$TAG" $ASSETS --clobber
-          echo "published: $ASSETS"
+          echo "published: $(cat published.txt)"
+
+      - name: Fail if a requested wing did not build
+        if: ${{ steps.research.outcome == 'failure' || steps.law.outcome == 'failure' }}
+        run: |
+          echo "research: ${{ steps.research.outcome }}"
+          echo "law: ${{ steps.law.outcome }}"
+          echo "One wing failed to build — see its step log above. Any wing that DID build was still published."
+          exit 1
