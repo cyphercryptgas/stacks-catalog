@@ -27,18 +27,32 @@ OUT = os.environ.get("OUT", "research.db")
 SELECT = "id,display_name,authorships,publication_year,cited_by_count,best_oa_location,doi"
 
 
-def get(url, tries=4):
+def get(url, tries=5):
+    last = None
     for attempt in range(tries):
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "hexadecagon-library-wing-builder"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except Exception as e:  # noqa: BLE001 - retry everything, log, move on
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:  # surface the API's complaint
+            body = ""
+            try:
+                body = e.read().decode("utf-8")[:300]
+            except Exception:  # noqa: BLE001
+                pass
+            last = "HTTP %s %s" % (e.code, body)
+            if e.code in (400, 403, 404):  # a real rejection won't fix itself by retrying
+                raise RuntimeError("OpenAlex rejected request: " + last + "\n  url: " + url)
+            print("  retry %d after %s" % (attempt + 1, last), flush=True)
+            time.sleep(3.0 * (attempt + 1))
+        except Exception as e:  # noqa: BLE001
+            last = str(e)
             if attempt == tries - 1:
                 raise
-            print("  retry %d after %s" % (attempt + 1, e), flush=True)
-            time.sleep(2.0 * (attempt + 1))
+            print("  retry %d after %s" % (attempt + 1, last), flush=True)
+            time.sleep(3.0 * (attempt + 1))
+    raise RuntimeError(last or "unreachable")
 
 
 def authors_of(work):
@@ -56,7 +70,10 @@ def pdf_of(work):
 
 
 def main():
-    fields = get(BASE + "/fields?per-page=50")["results"]
+    fj = get(BASE + "/fields?per-page=50")
+    fields = fj.get("results") or []
+    if not fields:
+        raise RuntimeError("OpenAlex /fields returned no results: " + json.dumps(fj)[:200])
     fields.sort(key=lambda f: f.get("id", ""))
     subjects = [f["display_name"].lower() for f in fields]
     print("fields: %d -> %s" % (len(fields), ", ".join(subjects[:5]) + " ..."), flush=True)
@@ -80,7 +97,7 @@ def main():
         fid = f["id"].rsplit("/", 1)[-1]
         cursor, rank = "*", 0
         while rank < PER_FIELD:
-            url = (BASE + "/works?filter=primary_topic.field.id:fields/" + fid +
+            url = (BASE + "/works?filter=primary_topic.field.id:" + fid +
                    "&sort=cited_by_count:desc&per-page=200"
                    "&cursor=" + urllib.parse.quote(cursor) +
                    "&select=" + SELECT +
