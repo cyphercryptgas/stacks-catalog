@@ -94,9 +94,64 @@ async function bootstrap() {
   console.log("index ready: " + (fs.statSync(DB_PATH).size / 1e9).toFixed(2) + " GB");
 }
 
+const WING_NAMES = ["research", "law"];
+
+async function bootstrapWings() {
+  let wj = null;
+  try {
+    wj = JSON.parse((await fetchBuf(assetURL("wings.json"))).toString("utf8"));
+  } catch (e) {
+    console.log("wings.json unreachable (" + e.message + ") \u2014 wings stay closed");
+    return;
+  }
+  for (const w of WING_NAMES) {
+    const m = wj && wj[w];
+    if (!m || !m.asset) continue;
+    const dbp = path.join(DATA_DIR, w + ".db");
+    const vp = path.join(DATA_DIR, w + ".version");
+    const have = fs.existsSync(dbp)
+      ? (fs.existsSync(vp) ? fs.readFileSync(vp, "utf8").trim() : "") : null;
+    if (have !== null && have === m.version) {
+      console.log("wing " + w + " present (" + have + ")");
+      continue;
+    }
+    try {
+      console.log("downloading wing " + w + " " + m.version);
+      const tmp = dbp + ".tmp";
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      await fetchGunzipAppend(assetURL(m.asset), tmp);
+      if (fs.existsSync(dbp)) fs.unlinkSync(dbp);
+      fs.renameSync(tmp, dbp);
+      fs.writeFileSync(vp, m.version);
+      console.log("wing " + w + " ready");
+    } catch (e) {
+      console.log("wing " + w + " download failed: " + e.message);
+    }
+  }
+}
+
 // ---------------------------------------------------------------- serving
 function startServer() {
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
+  const wings = {};
+  for (const w of WING_NAMES) {
+    const p = path.join(DATA_DIR, w + ".db");
+    if (!fs.existsSync(p)) continue;
+    try {
+      const wdb = new DatabaseSync(p, { readOnly: true });
+      const wm = Object.fromEntries(
+        wdb.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
+      wings[w] = {
+        subjects: JSON.parse(wm.subjects || "[]"),
+        built: wm.built || "", version: wm.version || "",
+        qRoom: wdb.prepare(
+          "SELECT * FROM works WHERE si = ? AND rank >= ? AND rank < ? ORDER BY rank"),
+      };
+      console.log("wing open: " + w + " \u2014 " + wings[w].subjects.length + " halls");
+    } catch (e) {
+      console.log("wing " + w + " failed to open: " + e.message);
+    }
+  }
   const metaRows = Object.fromEntries(
     db.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
   const SUBJECTS = JSON.parse(metaRows.subjects || "[]");
@@ -417,8 +472,13 @@ function startServer() {
     fs.writeFileSync(file, JSON.stringify(out));
   }
   async function arxivSearch(qstr) {
-    const xml = await tfetch(ARXIV_BASE + "/api/query?search_query=all:" +
-      encodeURIComponent('"' + qstr + '"') + "&start=0&max_results=20&sortBy=relevance", 20000);
+    const run = (sq) => tfetch(ARXIV_BASE + "/api/query?search_query=" +
+      encodeURIComponent(sq) + "&start=0&max_results=20&sortBy=relevance", 20000);
+    let xml = await run('all:"' + qstr + '"');
+    if (xml.indexOf("<entry>") === -1) { // the exact phrase missed — loosen to AND terms
+      const terms = qstr.split(/\s+/).filter(Boolean).slice(0, 6);
+      if (terms.length) xml = await run(terms.map((t) => "all:" + t).join(" AND "));
+    }
     const docs = [];
     const entries = xml.split("<entry>").slice(1);
     for (const e of entries) {
@@ -490,6 +550,27 @@ function startServer() {
   }
 
   const routes = {
+    "/wing/info": (q, res) => {
+      const out = {};
+      for (const w of Object.keys(wings))
+        out[w] = { subjects: wings[w].subjects, built: wings[w].built, version: wings[w].version };
+      send(res, 200, { wings: out });
+    },
+    "/wing/room": (q, res) => {
+      const w = String(q.searchParams.get("wing") || "");
+      const wing = wings[w];
+      if (!wing) return send(res, 404, { error: "no such wing \u2014 its index hasn't been built" }, true);
+      const n = wing.subjects.length || 1;
+      const si = Math.max(0, Math.min(n - 1, parseInt(q.searchParams.get("si"), 10) || 0));
+      const depth = Math.max(0, parseInt(q.searchParams.get("depth"), 10) || 0);
+      const rows = wing.qRoom.all(si, depth * ROOM_SIZE, (depth + 1) * ROOM_SIZE);
+      const books = rows.map((r) => ({
+        id: r.id, title: r.title, author: r.authors, year: r.year,
+        cited: r.cited, pdf: r.pdf || null, url: r.url || null,
+      }));
+      while (books.length < ROOM_SIZE) books.push(null);
+      send(res, 200, { wing: w, si, depth, got: rows.length, books });
+    },
     "/annex/papers": (q, res) => annexRoute("papers", q, res),
     "/annex/law": (q, res) => annexRoute("law", q, res),
     "/annex/case": (q, res) => annexRoute("case", q, res),
@@ -563,5 +644,6 @@ function startServer() {
 }
 
 bootstrap()
+  .then(bootstrapWings)
   .then(startServer)
   .catch((e) => { console.error("bootstrap failed:", e.message); process.exit(1); });
