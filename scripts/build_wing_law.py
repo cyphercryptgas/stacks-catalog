@@ -39,20 +39,34 @@ COURTS = [
 ]
 
 
-def get(url, tries=4):
+def get(url, tries=5):
+    last = None
     for attempt in range(tries):
         try:
             headers = {"User-Agent": "hexadecagon-library-wing-builder"}
             if TOKEN:
                 headers["Authorization"] = "Token " + TOKEN
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8")[:300]
+            except Exception:  # noqa: BLE001
+                pass
+            last = "HTTP %s %s" % (e.code, body)
+            if e.code in (400, 401, 403, 404):
+                raise RuntimeError("CourtListener rejected request: " + last + "\n  url: " + url)
+            print("  retry %d after %s" % (attempt + 1, last), flush=True)
+            time.sleep(4.0 * (attempt + 1))  # 429s want patience
         except Exception as e:  # noqa: BLE001
+            last = str(e)
             if attempt == tries - 1:
                 raise
-            print("  retry %d after %s" % (attempt + 1, e), flush=True)
-            time.sleep(3.0 * (attempt + 1))
+            print("  retry %d after %s" % (attempt + 1, last), flush=True)
+            time.sleep(4.0 * (attempt + 1))
+    raise RuntimeError(last or "unreachable")
 
 
 def main():
@@ -66,7 +80,7 @@ def main():
         " PRIMARY KEY(si, rank));"
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);")
 
-    pause = 0.15 if TOKEN else 0.6
+    pause = 0.2 if TOKEN else 0.8
     for si, (cid, label) in enumerate(COURTS):
         have = con.execute("SELECT COUNT(*) FROM works WHERE si=?", (si,)).fetchone()[0]
         if have >= PER_COURT:
@@ -77,7 +91,8 @@ def main():
         url = (BASE + "/api/rest/v4/search/?type=o&court=" + cid +
                "&order_by=" + urllib.parse.quote("citeCount desc"))
         rank = 0
-        while rank < PER_COURT and url:
+        try:
+          while rank < PER_COURT and url:
             j = get(url)
             results = j.get("results") or []
             if not results:
@@ -104,6 +119,8 @@ def main():
             con.commit()
             url = j.get("next")
             time.sleep(pause)
+        except Exception as e:  # noqa: BLE001 - a court may 500 or rate-limit; keep the others
+            print("hall %2d %-34s ERROR %s (shelved %d so far)" % (si, label, e, rank), flush=True)
         print("hall %2d %-34s shelved %d" % (si, label, rank), flush=True)
 
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
