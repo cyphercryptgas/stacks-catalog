@@ -387,7 +387,112 @@ function startServer() {
     return { gutenberg: hits[0].id };
   }
 
+  // ---- The Annex: research papers (arXiv) and case law (CourtListener) ----
+  const ARXIV_BASE = (process.env.ARXIV_BASE || "http://export.arxiv.org").replace(/\/+$/, "");
+  const CL_BASE = (process.env.COURTLISTENER_BASE || "https://www.courtlistener.com").replace(/\/+$/, "");
+  const ANNEX_DIR = path.join(DATA_DIR, "annex");
+  const tagOf = (xml, tag) => {
+    const m = xml.match(new RegExp("<" + tag + "[^>]*>([\\s\\S]*?)</" + tag + ">"));
+    return m ? m[1].replace(/<[^>]+>/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/\s+/g, " ").trim() : "";
+  };
+  async function tfetch(url, ms) {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), ms || 20000);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, headers: UA });
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+      return await r.text();
+    } finally { clearTimeout(tm); }
+  }
+  function annexCache(file) {
+    if (fs.existsSync(file)) {
+      try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {}
+    }
+    return null;
+  }
+  function annexSave(file, out) {
+    fs.mkdirSync(ANNEX_DIR, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(out));
+  }
+  async function arxivSearch(qstr) {
+    const xml = await tfetch(ARXIV_BASE + "/api/query?search_query=all:" +
+      encodeURIComponent('"' + qstr + '"') + "&start=0&max_results=20&sortBy=relevance", 20000);
+    const docs = [];
+    const entries = xml.split("<entry>").slice(1);
+    for (const e of entries) {
+      const id = tagOf(e, "id"); // e.g. http://arxiv.org/abs/2401.12345v2
+      const aid = (id.match(/abs\/([^\s]+?)(v\d+)?$/) || [])[1] || id;
+      const authors = [...e.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((m) => m[1].trim());
+      const pdfm = e.match(/<link[^>]*title="pdf"[^>]*href="([^"]+)"/) ||
+        e.match(/<link[^>]*href="([^"]+\/pdf\/[^"]+)"/);
+      docs.push({
+        id: aid,
+        title: tagOf(e, "title"),
+        authors: authors.slice(0, 4),
+        year: (tagOf(e, "published").match(/^(\d{4})/) || [])[1] || null,
+        summary: tagOf(e, "summary").slice(0, 420),
+        pdf: pdfm ? pdfm[1].replace(/^http:/, "https:") : null,
+        page: id.replace(/^http:/, "https:"),
+      });
+    }
+    return { docs: docs.slice(0, 20) };
+  }
+  async function lawSearch(qstr) {
+    const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
+      encodeURIComponent(qstr), 20000));
+    const docs = [];
+    for (const r of (j.results || []).slice(0, 20)) {
+      const op = (r.opinions && r.opinions[0]) || {};
+      docs.push({
+        id: op.id || null,
+        title: r.caseName || r.case_name || "Untitled case",
+        court: r.court_citation_string || r.court || "",
+        year: ((r.dateFiled || r.date_filed || "").match(/^(\d{4})/) || [])[1] || null,
+        cite: Array.isArray(r.citation) ? r.citation.slice(0, 2).join(" \u00b7 ") : (r.citation || ""),
+        url: r.absolute_url ? CL_BASE + r.absolute_url : null,
+      });
+    }
+    return { docs };
+  }
+  async function lawCase(id) {
+    const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + id + "/?format=json", 20000));
+    let text = j.plain_text || "";
+    if (!text) {
+      const html = j.html_with_citations || j.html || j.html_lawbox || j.html_columbia || "";
+      text = html.replace(/<\/(p|div|h\d|blockquote)>/gi, "\n\n")
+        .replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, " ")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/[ \t]+/g, " ");
+    }
+    return { id, text: text.trim().slice(0, 1200000) };
+  }
+  function annexRoute(kind, q, res) {
+    const qstr = String(q.searchParams.get("q") || "").trim().slice(0, 160);
+    if (kind === "case") {
+      const id = String(q.searchParams.get("id") || "").replace(/[^0-9]/g, "").slice(0, 12);
+      if (!id) return send(res, 400, { error: "id required" }, true);
+      const file = path.join(ANNEX_DIR, "case-" + id + ".json");
+      const hit = annexCache(file);
+      if (hit) return send(res, 200, hit);
+      return lawCase(id).then((out) => { annexSave(file, out); send(res, 200, out); })
+        .catch((e) => send(res, 502, { error: "case fetch failed: " + e.message }, true));
+    }
+    if (qstr.length < 2) return send(res, 400, { error: "q required" }, true);
+    const slug = qstr.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 70);
+    const file = path.join(ANNEX_DIR, kind + "-" + slug + ".json");
+    const hit = annexCache(file);
+    if (hit) return send(res, 200, hit);
+    const p = kind === "papers" ? arxivSearch(qstr) : lawSearch(qstr);
+    p.then((out) => { annexSave(file, out); send(res, 200, out); })
+      .catch((e) => send(res, 502, { error: kind + " search failed: " + e.message }, true));
+  }
+
   const routes = {
+    "/annex/papers": (q, res) => annexRoute("papers", q, res),
+    "/annex/law": (q, res) => annexRoute("law", q, res),
+    "/annex/case": (q, res) => annexRoute("case", q, res),
     "/audio/resolve": (q, res) => audioRoute(q, res),
     "/gutenberg-find": (q, res) => {
       const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
@@ -418,8 +523,13 @@ function startServer() {
       const raw = String(q.searchParams.get("q") || "").trim().slice(0, 120);
       const limit = Math.max(1, Math.min(40, parseInt(q.searchParams.get("limit"), 10) || 18));
       if (raw.length < 2) return send(res, 200, { docs: [] });
-      const terms = raw.split(/\s+/).filter(Boolean).slice(0, 8)
-        .map((t) => '"' + t.replace(/"/g, "") + '"').join(" ");
+      // articles and glue-words would force-exclude exact titles that lack them
+      // ("The Metamorphosis" must find works titled plain "Metamorphosis")
+      const STOP = new Set(["the", "a", "an", "of", "and", "or", "in", "on", "to"]);
+      const all = raw.split(/\s+/).filter(Boolean).slice(0, 8);
+      let toks = all.filter((t) => !STOP.has(t.toLowerCase()));
+      if (!toks.length) toks = all;
+      const terms = toks.map((t) => '"' + t.replace(/"/g, "") + '"').join(" ");
       let rows = [];
       try { rows = qFts.all(terms, limit); } catch (e) { rows = []; }
       if (!rows.length) rows = qLike.all("%" + raw + "%", limit);
