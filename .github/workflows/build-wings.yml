@@ -20,6 +20,9 @@ on:
       per_title:
         description: "Sections per U.S. Code title (law statutes)"
         default: "1920"
+      per_nos:
+        description: "Dockets per case-type hall (RECAP)"
+        default: "640"
   schedule:
     - cron: "20 7 3 * *" # monthly, the 3rd at 07:20 UTC
 
@@ -80,6 +83,16 @@ jobs:
           GOVINFO_KEY: ${{ secrets.GOVINFO_KEY }}
           OUT: law.db
         run: python scripts/append_law_statutes.py
+
+      - name: Append RECAP dockets (federal cases by type)
+        id: law_dockets
+        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          PER_NOS: ${{ inputs.per_nos || '640' }}
+          CL_TOKEN: ${{ secrets.CL_TOKEN }}
+          OUT: law.db
+        run: python scripts/append_law_dockets.py
 
       - name: Publish to the release
         run: |
