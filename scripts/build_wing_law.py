@@ -23,6 +23,10 @@ import urllib.request
 BASE = os.environ.get("COURTLISTENER_BASE", "https://www.courtlistener.com").rstrip("/")
 TOKEN = os.environ.get("CL_TOKEN", "")
 PER_COURT = int(os.environ.get("PER_COURT", "2560"))
+# pre-cache full text for the top-N most-cited opinions per court (instant reads,
+# no live rate-limit). 0 disables. ~13s pacing keeps under 5 requests/minute.
+PRECACHE = int(os.environ.get("PRECACHE", "40"))
+PRECACHE_PAUSE = float(os.environ.get("PRECACHE_PAUSE", "13"))
 OUT = os.environ.get("OUT", "law.db")
 
 COURTS = [
@@ -82,6 +86,34 @@ def get(url, tries=5):
     raise RuntimeError(last or "unreachable")
 
 
+def clean_opinion_html(html):
+    import re
+    t = re.sub(r"</(p|div|h\d|blockquote)>", "\n\n", html, flags=re.I)
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = (t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+         .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " "))
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def opinion_text(op_id):
+    """Fetch one opinion's full text (cluster fallback). Returns text or ''."""
+    try:
+        j = get(BASE + "/api/rest/v4/opinions/%s/?format=json" % op_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    txt = j.get("plain_text") or ""
+    if not txt:
+        for key in ("html_with_citations", "html", "html_lawbox", "html_columbia"):
+            if j.get(key):
+                txt = clean_opinion_html(j[key])
+                if txt:
+                    break
+    return (txt or "")[:600000]
+
+
 def main():
     subjects = [label.lower() for _, label in COURTS]
     con = sqlite3.connect(OUT)
@@ -91,6 +123,7 @@ def main():
         " si INTEGER, rank INTEGER, id TEXT, title TEXT, authors TEXT,"
         " year INTEGER, cited INTEGER, pdf TEXT, url TEXT,"
         " PRIMARY KEY(si, rank));"
+        "CREATE TABLE IF NOT EXISTS bodies(id TEXT PRIMARY KEY, text TEXT);"
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);")
 
     pause = 0.2 if TOKEN else 0.8
@@ -135,6 +168,26 @@ def main():
         except Exception as e:  # noqa: BLE001 - a court may 500 or rate-limit; keep the others
             print("hall %2d %-34s ERROR %s (shelved %d so far)" % (si, label, e, rank), flush=True)
         print("hall %2d %-34s shelved %d" % (si, label, rank), flush=True)
+
+        # pre-cache full text for the most-cited opinions in this court, so the
+        # famous cases read instantly from the DB and never hit the rate limit.
+        if PRECACHE > 0:
+            top = con.execute(
+                "SELECT id FROM works WHERE si=? AND id!='' ORDER BY rank LIMIT ?",
+                (si, PRECACHE)).fetchall()
+            done = 0
+            for (op_id,) in top:
+                if con.execute("SELECT 1 FROM bodies WHERE id=?", (op_id,)).fetchone():
+                    done += 1
+                    continue
+                txt = opinion_text(op_id)
+                if txt:
+                    con.execute("INSERT OR REPLACE INTO bodies VALUES(?,?)", (op_id, txt))
+                    done += 1
+                # rate-limit-aware: CourtListener allows ~5/min on a free token
+                time.sleep(PRECACHE_PAUSE)
+            con.commit()
+            print("hall %2d %-34s pre-cached %d/%d texts" % (si, label, done, len(top)), flush=True)
 
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
     for k, v in (("kind", "law"), ("subjects", json.dumps(subjects)),
