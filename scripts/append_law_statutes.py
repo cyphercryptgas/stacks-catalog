@@ -271,33 +271,33 @@ def main():
         rows = []
         if kind == "usc":
             secs = uscode_sections(yr, title, PER_TITLE)
-            base_url = "https://www.govinfo.gov/app/details/USCODE-%s-title%d" % (yr, title)
+            pkg = "USCODE-%s-title%d" % (yr, title)
             for rank, (gid, txt) in enumerate(secs):
+                # granule details page resolves; whole-title content htm also exists as a fallback
+                detail = "https://www.govinfo.gov/app/details/%s/%s" % (pkg, gid)
+                content = "https://www.govinfo.gov/content/pkg/%s/html/%s.htm" % (pkg, pkg)
                 rows.append((si, rank, gid, txt[:240],
-                             "U.S. Code \u00b7 Title %d" % title, yr, 0,
-                             "https://www.govinfo.gov/content/pkg/USCODE-%s-title%d/html/USCODE-%s-title%d.htm"
-                             % (yr, title, yr, title),
-                             base_url))
+                             "U.S. Code \u00b7 Title %d" % title, yr, 0, content, detail))
         elif kind == "cfr":
             secs = cfr_sections(yr, title, PER_TITLE)
             base_url = "https://www.govinfo.gov/app/collection/CFR/%s/title-%d" % (yr, title)
             for rank, (gid, txt) in enumerate(secs):
+                # gid like CFR-2023-title1-vol1-sec1-1 -> package is up to the vol
+                pkg = "-".join(gid.split("-")[:4]) if "-vol" in gid else gid
+                detail = "https://www.govinfo.gov/app/details/%s/%s" % (pkg, gid)
                 rows.append((si, rank, gid, txt[:240],
-                             "CFR \u00b7 Title %d" % title, yr, 0,
-                             "https://www.govinfo.gov/link/cfr/%d/%s" % (title, yr),
-                             base_url))
-            if not secs:  # fall back to the title landing if no granules came back
+                             "CFR \u00b7 Title %d" % title, yr, 0, None, detail))
+            if not secs:
                 rows.append((si, 0, "CFR-%s-title%d" % (yr, title),
                              "Code of Federal Regulations \u2014 Title %d" % title,
                              "CFR \u00b7 Title %d" % title, yr, 0, None, base_url))
         else:  # plaw — public laws of a Congress
             laws = plaw_for_congress(title, PER_TITLE)
-            base_url = "https://www.govinfo.gov/app/collection/PLAW/%dth-congress" % title
             for rank, (pid, txt) in enumerate(laws):
+                detail = "https://www.govinfo.gov/app/details/" + pid
+                content = "https://www.govinfo.gov/content/pkg/%s/html/%s.htm" % (pid, pid)
                 rows.append((si, rank, pid, txt,
-                             "%dth Congress" % title, None, 0,
-                             "https://www.govinfo.gov/content/pkg/%s/html/%s.htm" % (pid, pid),
-                             "https://www.govinfo.gov/app/details/" + pid))
+                             "%dth Congress" % title, None, 0, content, detail))
         if not rows:
             print("hall %2d %-44s EMPTY (no packages)" % (si, label[:44]), flush=True)
             # still register the hall so numbering stays stable
