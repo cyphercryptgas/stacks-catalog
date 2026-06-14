@@ -899,6 +899,34 @@ function startServer() {
       pgFind(title, author).then((out) => send(res, 200, out))
         .catch((e) => send(res, 502, { error: "pg catalog lookup failed: " + e.message }, true));
     },
+    "/debug/statute": (q, res) => {
+      const id = String(q.searchParams.get("id") || "USCODE-2022-title17-chap1-sec107");
+      const gid = id;
+      let pkg = gid;
+      const mTitle = gid.match(/^([A-Z]+-\d{4}(?:-\d{2}-\d{2})?(?:-title\d+(?:-vol\d+)?)?)/);
+      if (mTitle) pkg = mTitle[1];
+      const KEY = GOVINFO_KEY ? "?api_key=" + encodeURIComponent(GOVINFO_KEY) : "";
+      const tries = [
+        "https://api.govinfo.gov/packages/" + gid + "/htm" + KEY,
+        "https://api.govinfo.gov/packages/" + pkg + "/htm" + KEY,
+        "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm",
+        "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm",
+      ];
+      (async () => {
+        const out = { id, pkg, key_present: !!GOVINFO_KEY, tries: [] };
+        for (const u of tries) {
+          const rec = { url: u.replace(/api_key=[^&]+/, "api_key=***") };
+          try {
+            const raw = await tfetch(u, 15000);
+            rec.status = "ok";
+            rec.length = raw.length;
+            rec.head = raw.slice(0, 200).replace(/\s+/g, " ");
+          } catch (e) { rec.status = "fail"; rec.error = e.message; }
+          out.tries.push(rec);
+        }
+        send(res, 200, out, true);
+      })();
+    },
     "/health": (q, res) => send(res, 200, { ok: true }, true),
     "/version": (q, res) => send(res, 200, {
       version: fs.existsSync(VER_PATH) ? fs.readFileSync(VER_PATH, "utf8").trim() : metaRows.built,
