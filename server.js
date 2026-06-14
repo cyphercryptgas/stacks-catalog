@@ -621,7 +621,16 @@ function startServer() {
           body, 16000));
         for (const r of (sj.results || []).slice(0, 8)) {
           const pid = r.packageId || r.granuleId || "";
+          const gid = r.granuleId || "";
           const coll = (r.collectionCode || "").toUpperCase();
+          // govinfo content-URL patterns vary by collection and granule depth,
+          // and a wrong guess lands on the /error page. The package DETAILS page
+          // reliably resolves for every collection, so link there. When we have a
+          // granule, deep-link to the granule details under its package.
+          const pkgId = r.packageId || (gid ? gid.split("-sec")[0].split("-vol")[0] : pid);
+          const detailUrl = gid && r.packageId
+            ? "https://www.govinfo.gov/app/details/" + r.packageId + "/" + gid
+            : "https://www.govinfo.gov/app/details/" + (pkgId || pid);
           docs.push({
             kind: "statute",
             id: pid,
@@ -630,16 +639,15 @@ function startServer() {
               : coll === "PLAW" ? "Public Law" : "United States Code",
             year: (r.dateIssued || "").slice(0, 4) || null,
             cite: "",
-            url: pid ? "https://www.govinfo.gov/app/details/" + pid : null,
-            pdf: pid ? "https://www.govinfo.gov/content/pkg/" + pid + "/html/" + pid + ".htm" : null,
+            url: detailUrl,
+            pdf: null, // the details page always resolves; constructed content URLs do not
           });
         }
       }
     } catch (e) { /* statutes optional */ }
     return { docs: docs.slice(0, 28) };
   }
-  async function lawCase(id) {
-    const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + id + "/?format=json", 20000));
+  async function clOpinionText(j) {
     let text = j.plain_text || "";
     if (!text) {
       const html = j.html_with_citations || j.html || j.html_lawbox || j.html_columbia || "";
@@ -648,7 +656,30 @@ function startServer() {
         .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
         .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/[ \t]+/g, " ");
     }
-    return { id, text: text.trim().slice(0, 1200000) };
+    return text.trim();
+  }
+  async function lawCase(id) {
+    // try as an opinion id first
+    let text = "";
+    try {
+      const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + id + "/?format=json", 20000));
+      text = await clOpinionText(j);
+    } catch (e1) {
+      // maybe it's a cluster id: fetch the cluster, then its lead sub-opinion
+      try {
+        const c = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/clusters/" + id + "/?format=json", 18000));
+        const subs = c.sub_opinions || [];
+        const first = subs[0] || "";
+        const opId = String(first).match(/opinions\/(\d+)\//);
+        if (opId) {
+          const j2 = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + opId[1] + "/?format=json", 18000));
+          text = await clOpinionText(j2);
+        }
+      } catch (e2) {
+        throw new Error("opinion " + id + " unavailable (" + (e1.message || e2.message) + ")");
+      }
+    }
+    return { id, text: (text || "").slice(0, 1200000) };
   }
   async function lawDocket(id) {
     const dj = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/dockets/" + id + "/?format=json", 20000));
