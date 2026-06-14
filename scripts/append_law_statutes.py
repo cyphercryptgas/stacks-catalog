@@ -14,7 +14,7 @@ Env:
   GOVINFO_KEY    api.data.gov key (DEMO_KEY works but is heavily rate-limited)
   USCODE_YEAR    edition year to pull (default: latest the API offers)
   PER_TITLE      sections per title (default 1920 = 3 rooms of 640)
-  WHICH          "both" | "uscode" | "cfr"  (default both)
+  WHICH          "both" | "uscode" | "cfr" | "plaw"  (default both)
   OUT            law.db path (default law.db)
 """
 import datetime
@@ -147,6 +147,83 @@ def uscode_sections(year, title, cap):
     return rows
 
 
+def cfr_sections(year, title, cap):
+    """Walk granules across all volumes of one CFR title; each section a row."""
+    rows = []
+    # CFR titles are split into volumes: CFR-{year}-title{T}-vol{V}
+    for vol in range(1, 30):
+        if len(rows) >= cap:
+            break
+        pid = "CFR-%s-title%d-vol%d" % (year, title, vol)
+        offset, got_any = "*", False
+        while len(rows) < cap:
+            url = k(BASE + "/packages/" + pid + "/granules?pageSize=100&offsetMark=" +
+                    urllib.parse.quote(offset))
+            try:
+                j = get_json(url)
+            except RuntimeError:
+                break  # this volume number doesn't exist; try the next
+            gr = j.get("granules") or []
+            if not gr:
+                break
+            got_any = True
+            for g in gr:
+                if len(rows) >= cap:
+                    break
+                gid = g.get("granuleId", "")
+                rows.append((gid, (g.get("title") or gid)))
+            nxt = j.get("nextPage")
+            if not nxt:
+                break
+            try:
+                q = urllib.parse.urlparse(nxt).query
+                offset = urllib.parse.parse_qs(q).get("offsetMark", ["*"])[0]
+            except Exception:  # noqa: BLE001
+                break
+            time.sleep(0.15)
+        if not got_any and vol > 1:
+            break  # no more volumes for this title
+    return rows
+
+
+def plaw_for_congress(congress, cap):
+    """Public laws of one Congress, newest law number first."""
+    rows = []
+    url = k(BASE + "/collections/PLAW/2000-01-01T00:00:00Z?pageSize=100&offsetMark=*" +
+            "&congress=" + str(congress))
+    offset = "*"
+    while len(rows) < cap:
+        u = k(BASE + "/collections/PLAW/2000-01-01T00:00:00Z?pageSize=100&offsetMark=" +
+              urllib.parse.quote(offset) + "&congress=" + str(congress))
+        try:
+            j = get_json(u)
+        except RuntimeError:
+            break
+        pkgs = j.get("packages") or []
+        if not pkgs:
+            break
+        for p in pkgs:
+            if len(rows) >= cap:
+                break
+            pid = p.get("packageId", "")  # PLAW-119publ9
+            if "priv" in pid:  # skip private laws
+                continue
+            title = p.get("title") or pid
+            m = pid.replace("PLAW-", "").replace("publ", " Pub. L. ")
+            rows.append((pid, ("Pub. L. " + pid.split("publ")[-1] + " \u2014 " + title)[:240]))
+        offset = j.get("nextPage") and "" or None
+        nxt = j.get("nextPage")
+        if not nxt:
+            break
+        try:
+            q = urllib.parse.urlparse(nxt).query
+            offset = urllib.parse.parse_qs(q).get("offsetMark", ["*"])[0]
+        except Exception:  # noqa: BLE001
+            break
+        time.sleep(0.15)
+    return rows
+
+
 def main():
     con = sqlite3.connect(OUT)
     cur = con.cursor()
@@ -174,6 +251,12 @@ def main():
     if WHICH in ("both", "cfr"):
         for t in range(1, 51):
             plan.append(("cfr", year, t, "cfr \u00b7 title %d" % t))
+    if WHICH in ("both", "plaw"):
+        # recent Congresses of public laws; each Congress is a hall
+        congresses = [int(c) for c in
+                      os.environ.get("PLAW_CONGRESSES", "119,118,117,116,115").split(",")]
+        for c in congresses:
+            plan.append(("plaw", c, c, "public laws \u00b7 %dth congress" % c))
 
     if MAX_TITLES > 0:
         plan = plan[:MAX_TITLES]
@@ -195,11 +278,26 @@ def main():
                              "https://www.govinfo.gov/content/pkg/USCODE-%s-title%d/html/USCODE-%s-title%d.htm"
                              % (yr, title, yr, title),
                              base_url))
-        else:  # cfr title landing (section-level granule walk is huge; link the title)
+        elif kind == "cfr":
+            secs = cfr_sections(yr, title, PER_TITLE)
             base_url = "https://www.govinfo.gov/app/collection/CFR/%s/title-%d" % (yr, title)
-            rows.append((si, 0, "CFR-%s-title%d" % (yr, title),
-                         "Code of Federal Regulations \u2014 Title %d" % title,
-                         "CFR \u00b7 Title %d" % title, yr, 0, None, base_url))
+            for rank, (gid, txt) in enumerate(secs):
+                rows.append((si, rank, gid, txt[:240],
+                             "CFR \u00b7 Title %d" % title, yr, 0,
+                             "https://www.govinfo.gov/link/cfr/%d/%s" % (title, yr),
+                             base_url))
+            if not secs:  # fall back to the title landing if no granules came back
+                rows.append((si, 0, "CFR-%s-title%d" % (yr, title),
+                             "Code of Federal Regulations \u2014 Title %d" % title,
+                             "CFR \u00b7 Title %d" % title, yr, 0, None, base_url))
+        else:  # plaw — public laws of a Congress
+            laws = plaw_for_congress(title, PER_TITLE)
+            base_url = "https://www.govinfo.gov/app/collection/PLAW/%dth-congress" % title
+            for rank, (pid, txt) in enumerate(laws):
+                rows.append((si, rank, pid, txt,
+                             "%dth Congress" % title, None, 0,
+                             "https://www.govinfo.gov/content/pkg/%s/html/%s.htm" % (pid, pid),
+                             "https://www.govinfo.gov/app/details/" + pid))
         if not rows:
             print("hall %2d %-44s EMPTY (no packages)" % (si, label[:44]), flush=True)
             # still register the hall so numbering stays stable
