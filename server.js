@@ -444,6 +444,7 @@ function startServer() {
 
   // ---- The Annex: research papers (arXiv) and case law (CourtListener) ----
   const ARXIV_BASE = (process.env.ARXIV_BASE || "http://export.arxiv.org").replace(/\/+$/, "");
+  const DOAB_BASE = (process.env.DOAB_BASE || "https://directory.doabooks.org").replace(/\/+$/, "");
   const CL_BASE = (process.env.COURTLISTENER_BASE || "https://www.courtlistener.com").replace(/\/+$/, "");
   const GOVINFO_KEY = process.env.GOVINFO_KEY || "";
   const ANNEX_DIR = path.join(DATA_DIR, "annex");
@@ -512,6 +513,56 @@ function startServer() {
       });
     }
     return { docs: docs.slice(0, 20) };
+  }
+  async function doabSearch(qstr) {
+    // open-access academic books, full text, from the Directory of Open Access Books
+    const url = DOAB_BASE + "/rest/search?query=" + encodeURIComponent(qstr) +
+      "&expand=metadata,bitstreams&limit=12&offset=0";
+    let items;
+    try { items = JSON.parse(await tfetch(url, 16000)); }
+    catch (e) { return []; }
+    if (!Array.isArray(items)) return [];
+    const metaVal = (it, k2) => {
+      for (const m of (it.metadata || [])) if (m.key === k2) return m.value;
+      return null;
+    };
+    const metaAll = (it, k2) =>
+      (it.metadata || []).filter((m) => m.key === k2).map((m) => m.value);
+    const pdfOf = (it) => {
+      for (const b of (it.bitstreams || [])) {
+        const mime = (b.mimeType || "").toLowerCase();
+        const nm = (b.name || "").toLowerCase();
+        if (mime.indexOf("pdf") !== -1 || nm.endsWith(".pdf")) {
+          const link = b.retrieveLink || b.link;
+          if (link) return link.indexOf("http") === 0 ? link : DOAB_BASE + link;
+        }
+      }
+      return null;
+    };
+    const docs = [];
+    for (const it of items.slice(0, 12)) {
+      const handle = it.handle || it.uuid || "";
+      docs.push({
+        kind: "book",
+        id: "doab:" + handle,
+        title: (metaVal(it, "dc.title") || "Untitled").slice(0, 220),
+        authors: metaAll(it, "dc.contributor.author").filter(Boolean).slice(0, 4),
+        year: ((metaVal(it, "dc.date.issued") || "").match(/(\d{4})/) || [])[1] || null,
+        summary: (metaVal(it, "dc.description.abstract") || "").slice(0, 420),
+        pdf: pdfOf(it),
+        page: handle ? "https://directory.doabooks.org/handle/" + handle : null,
+      });
+    }
+    return docs;
+  }
+  async function researchSearch(qstr) {
+    // run arXiv and DOAB together; papers first, then open-access books
+    const [papers, books] = await Promise.all([
+      arxivSearch(qstr).then((r) => (r && r.docs) || []).catch(() => []),
+      doabSearch(qstr).catch(() => []),
+    ]);
+    const tagged = papers.map((p) => Object.assign({ kind: "paper" }, p));
+    return { docs: tagged.concat(books).slice(0, 28) };
   }
   async function lawSearch(qstr) {
     const docs = [];
@@ -678,7 +729,7 @@ function startServer() {
     const file = path.join(ANNEX_DIR, kind + "-" + slug + ".json");
     const hit = annexCache(file);
     if (hit) return send(res, 200, hit);
-    const p = kind === "papers" ? arxivSearch(qstr) : lawSearch(qstr);
+    const p = kind === "papers" ? researchSearch(qstr) : lawSearch(qstr);
     p.then((out) => { annexSave(file, out); send(res, 200, out); })
       .catch((e) => send(res, 502, { error: kind + " search failed: " + e.message }, true));
   }
