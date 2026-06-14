@@ -763,35 +763,23 @@ function startServer() {
   async function lawStatute(id) {
     // id is a govinfo package or granule id (USCODE-.../CFR-.../PLAW-.../etc).
     const gid = String(id);
-    // derive the package id: strip granule suffixes (-sec.., -vol.., -Pg.., -part..)
+    // derive the package id from the granule id
     let pkg = gid;
-    const cut = gid.search(/-(sec|vol|part|chap|subchap|Pg|pt|art)\b/);
-    // packages are like USCODE-2008-title28 or WCPD-2008-07-14 (date packages have no granule)
     const mTitle = gid.match(/^([A-Z]+-\d{4}(?:-\d{2}-\d{2})?(?:-title\d+(?:-vol\d+)?)?)/);
-    if (cut !== -1 && mTitle) pkg = mTitle[1];
-    else if (cut !== -1) pkg = gid.slice(0, cut);
+    if (mTitle) pkg = mTitle[1];
 
-    const KEY = GOVINFO_KEY ? "?api_key=" + encodeURIComponent(GOVINFO_KEY) : "";
-    // 1) the API text endpoints are the reliable source (raw text, not the nav page)
-    const apiTries = [
-      "https://api.govinfo.gov/packages/" + gid + "/htm" + KEY,        // granule-as-package
-      "https://api.govinfo.gov/packages/" + pkg + "/htm" + KEY,        // package text
-    ];
-    // 2) content-file paths as a fallback: pkg in path, granule in filename
-    const contentTries = [
-      "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm",
-      "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm",
-    ];
-
-    function looksLikeChrome(t) {
-      // the details page is all navigation; reject it
-      const head = t.slice(0, 1500).toLowerCase();
-      return head.indexOf("skip to main content") !== -1 ||
-        (head.indexOf("browse a to z") !== -1 && head.indexOf("\u00a7") === -1) ||
-        head.indexOf("<!doctype html") !== -1 && head.indexOf("govinfo") !== -1 && t.length < 4000;
+    const isGranule = gid !== pkg; // we have a specific section/granule
+    // The GRANULE content file is the clean single-section text. The package-level
+    // files (api /htm and pkg/.../{pkg}.htm) return the ENTIRE title (megabytes),
+    // so only use those when we don't have a granule.
+    const tries = [];
+    if (isGranule) {
+      tries.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm");
     }
+    tries.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm");
+
     function clean(raw) {
-      let txt = raw.replace(/<head[\s\S]*?<\/head>/i, "")
+      return raw.replace(/<head[\s\S]*?<\/head>/i, "")
         .replace(/<script[\s\S]*?<\/script>/gi, "")
         .replace(/<style[\s\S]*?<\/style>/gi, "")
         .replace(/<\/(p|div|h\d|tr|li|pre)>/gi, "\n")
@@ -800,26 +788,27 @@ function startServer() {
         .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
         .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
         .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-      return txt;
     }
 
     let txt = "";
-    for (const u of apiTries.concat(contentTries)) {
+    for (const u of tries) {
       try {
         const raw = await tfetch(u, 18000);
         if (!raw) continue;
-        if (looksLikeChrome(raw)) continue; // skip the nav page
+        // guard against the multi-megabyte whole-title dump leaking through
+        if (raw.length > 600000 && isGranule) continue;
         const c = clean(raw);
-        if (c && c.length > 80) { txt = c; break; }
+        if (c && c.length > 60) { txt = c; break; }
       } catch (e) { /* try next */ }
     }
     if (!txt) {
       const e = new Error("nohtml"); e.nohtml = true;
-      e.detail = "https://www.govinfo.gov/app/details/" + pkg;
+      e.detail = "https://www.govinfo.gov/app/details/" + pkg +
+        (isGranule ? "/" + gid : "");
       throw e;
     }
     return { id: gid, text: txt.slice(0, 1200000),
-      detail: "https://www.govinfo.gov/app/details/" + pkg };
+      detail: "https://www.govinfo.gov/app/details/" + pkg + (isGranule ? "/" + gid : "") };
   }
   function annexRoute(kind, q, res) {
     const qstr = String(q.searchParams.get("q") || "").trim().slice(0, 160);
@@ -898,34 +887,6 @@ function startServer() {
       if (title.length < 2) return send(res, 400, { error: "title required" }, true);
       pgFind(title, author).then((out) => send(res, 200, out))
         .catch((e) => send(res, 502, { error: "pg catalog lookup failed: " + e.message }, true));
-    },
-    "/debug/statute": (q, res) => {
-      const id = String(q.searchParams.get("id") || "USCODE-2022-title17-chap1-sec107");
-      const gid = id;
-      let pkg = gid;
-      const mTitle = gid.match(/^([A-Z]+-\d{4}(?:-\d{2}-\d{2})?(?:-title\d+(?:-vol\d+)?)?)/);
-      if (mTitle) pkg = mTitle[1];
-      const KEY = GOVINFO_KEY ? "?api_key=" + encodeURIComponent(GOVINFO_KEY) : "";
-      const tries = [
-        "https://api.govinfo.gov/packages/" + gid + "/htm" + KEY,
-        "https://api.govinfo.gov/packages/" + pkg + "/htm" + KEY,
-        "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm",
-        "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm",
-      ];
-      (async () => {
-        const out = { id, pkg, key_present: !!GOVINFO_KEY, tries: [] };
-        for (const u of tries) {
-          const rec = { url: u.replace(/api_key=[^&]+/, "api_key=***") };
-          try {
-            const raw = await tfetch(u, 15000);
-            rec.status = "ok";
-            rec.length = raw.length;
-            rec.head = raw.slice(0, 200).replace(/\s+/g, " ");
-          } catch (e) { rec.status = "fail"; rec.error = e.message; }
-          out.tries.push(rec);
-        }
-        send(res, 200, out, true);
-      })();
     },
     "/health": (q, res) => send(res, 200, { ok: true }, true),
     "/version": (q, res) => send(res, 200, {
