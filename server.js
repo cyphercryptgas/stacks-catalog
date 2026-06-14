@@ -528,8 +528,77 @@ function startServer() {
     }
     return { id, text: text.trim().slice(0, 1200000) };
   }
+  async function lawDocket(id) {
+    const dj = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/dockets/" + id + "/?format=json", 20000));
+    const caseName = dj.case_name || dj.case_name_full || "Untitled docket";
+    const lines = [];
+    lines.push(caseName);
+    lines.push("");
+    const court = dj.court_id || (dj.court || "");
+    if (court) lines.push("Court: " + court);
+    if (dj.docket_number) lines.push("Docket No. " + dj.docket_number);
+    if (dj.date_filed) lines.push("Filed: " + dj.date_filed);
+    if (dj.date_terminated) lines.push("Terminated: " + dj.date_terminated);
+    if (dj.assigned_to_str) lines.push("Assigned to: " + dj.assigned_to_str);
+    if (dj.nature_of_suit) lines.push("Nature of suit: " + dj.nature_of_suit);
+    if (dj.cause) lines.push("Cause: " + dj.cause);
+    lines.push("");
+    // parties (best-effort; may be a separate endpoint)
+    try {
+      const pj = JSON.parse(await tfetch(
+        CL_BASE + "/api/rest/v4/parties/?docket=" + id + "&format=json", 18000));
+      const parties = (pj.results || []).slice(0, 24)
+        .map((p) => p.name + (p.party_types && p.party_types[0] ?
+          " (" + p.party_types[0].name + ")" : "")).filter(Boolean);
+      if (parties.length) {
+        lines.push("PARTIES");
+        for (const p of parties) lines.push("  " + p);
+        lines.push("");
+      }
+    } catch (e) { /* parties optional */ }
+    // docket entries: the filing history
+    let entries = [];
+    try {
+      let url = CL_BASE + "/api/rest/v4/docket-entries/?docket=" + id +
+        "&order_by=entry_number&format=json";
+      let guard = 0;
+      while (url && entries.length < 400 && guard++ < 5) {
+        const ej = JSON.parse(await tfetch(url, 20000));
+        for (const e of (ej.results || [])) {
+          const num = e.entry_number != null ? "#" + e.entry_number + "  " : "";
+          const date = e.date_filed ? e.date_filed + " \u2014 " : "";
+          const desc = (e.description || "").replace(/\s+/g, " ").trim();
+          const docs = (e.recap_documents || []).filter((d) => d.filepath_local || d.is_available);
+          const tag = docs.length ? "  [" + docs.length + " document" +
+            (docs.length === 1 ? "" : "s") + " freed]" : "";
+          entries.push(num + date + (desc || "(no description)") + tag);
+        }
+        url = ej.next;
+      }
+    } catch (e) { /* entries optional */ }
+    if (entries.length) {
+      lines.push("DOCKET (" + entries.length + " entries shown)");
+      lines.push("");
+      for (const e of entries) lines.push(e);
+    } else {
+      lines.push("No docket entries have been freed from PACER for this case yet.");
+      lines.push("The case record exists, but its filings are still behind the PACER paywall");
+      lines.push("until someone with the RECAP extension pulls them.");
+    }
+    return { id, text: lines.join("\n").slice(0, 1200000), caseName };
+  }
+
   function annexRoute(kind, q, res) {
     const qstr = String(q.searchParams.get("q") || "").trim().slice(0, 160);
+    if (kind === "docket") {
+      const id = String(q.searchParams.get("id") || "").replace(/[^0-9]/g, "").slice(0, 12);
+      if (!id) return send(res, 400, { error: "id required" }, true);
+      const file = path.join(ANNEX_DIR, "docket-" + id + ".json");
+      const hit = annexCache(file);
+      if (hit) return send(res, 200, hit);
+      return lawDocket(id).then((out) => { annexSave(file, out); send(res, 200, out); })
+        .catch((e) => send(res, 502, { error: "docket fetch failed: " + e.message }, true));
+    }
     if (kind === "case") {
       const id = String(q.searchParams.get("id") || "").replace(/[^0-9]/g, "").slice(0, 12);
       if (!id) return send(res, 400, { error: "id required" }, true);
@@ -574,6 +643,7 @@ function startServer() {
     "/annex/papers": (q, res) => annexRoute("papers", q, res),
     "/annex/law": (q, res) => annexRoute("law", q, res),
     "/annex/case": (q, res) => annexRoute("case", q, res),
+    "/annex/docket": (q, res) => annexRoute("docket", q, res),
     "/audio/resolve": (q, res) => audioRoute(q, res),
     "/gutenberg-find": (q, res) => {
       const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
