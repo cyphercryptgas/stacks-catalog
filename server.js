@@ -615,10 +615,12 @@ function startServer() {
     // 3) statutes & regulations (govinfo full-text search across USCODE/CFR/PLAW)
     try {
       if (GOVINFO_KEY) {
+        // collection filter MUST be a field operator inside the query string;
+        // a separate "collections" field is ignored and returns every collection.
         const body = JSON.stringify({
-          query: qstr, pageSize: 8, offsetMark: "*",
-          collections: ["USCODE", "CFR", "PLAW"],
-          resultLevel: "default", historical: false,
+          query: "collection:(USCODE OR CFR OR PLAW) AND (" + qstr + ")",
+          pageSize: "8", offsetMark: "*",
+          sorts: [{ field: "score", sortOrder: "DESC" }],
         });
         const sj = JSON.parse(await tfetchPost(
           "https://api.govinfo.gov/search?api_key=" + encodeURIComponent(GOVINFO_KEY),
@@ -626,25 +628,24 @@ function startServer() {
         for (const r of (sj.results || []).slice(0, 8)) {
           const pid = r.packageId || r.granuleId || "";
           const gid = r.granuleId || "";
-          const coll = (r.collectionCode || "").toUpperCase();
-          // govinfo content-URL patterns vary by collection and granule depth,
-          // and a wrong guess lands on the /error page. The package DETAILS page
-          // reliably resolves for every collection, so link there. When we have a
-          // granule, deep-link to the granule details under its package.
+          // derive collection from the id prefix so the label is always honest
+          const prefix = (pid.split("-")[0] || "").toUpperCase();
+          // only keep the three statute collections; skip anything else that slips through
+          if (["USCODE", "CFR", "PLAW"].indexOf(prefix) === -1) continue;
           const pkgId = r.packageId || (gid ? gid.split("-sec")[0].split("-vol")[0] : pid);
           const detailUrl = gid && r.packageId
             ? "https://www.govinfo.gov/app/details/" + r.packageId + "/" + gid
             : "https://www.govinfo.gov/app/details/" + (pkgId || pid);
           docs.push({
             kind: "statute",
-            id: pid,
+            id: gid || pid,
             title: (r.title || pid).slice(0, 200),
-            court: coll === "CFR" ? "Code of Federal Regulations"
-              : coll === "PLAW" ? "Public Law" : "United States Code",
+            court: prefix === "CFR" ? "Code of Federal Regulations"
+              : prefix === "PLAW" ? "Public Law" : "United States Code",
             year: (r.dateIssued || "").slice(0, 4) || null,
             cite: "",
             url: detailUrl,
-            pdf: null, // the details page always resolves; constructed content URLs do not
+            pdf: null,
           });
         }
       }
@@ -760,35 +761,63 @@ function startServer() {
   }
 
   async function lawStatute(id) {
-    // id is a govinfo package or granule id (USCODE-.../CFR-.../PLAW-...).
-    // Fetch the htm content and clean it for the typeset reader.
+    // id is a govinfo package or granule id (USCODE-.../CFR-.../PLAW-.../etc).
     const gid = String(id);
-    const pkg = gid.indexOf("-vol") !== -1 ? gid.split("-").slice(0, 4).join("-")
-      : gid.replace(/-sec.*$/, "");
-    // try granule htm first, then package htm
-    const candidates = [
+    // derive the package id: strip granule suffixes (-sec.., -vol.., -Pg.., -part..)
+    let pkg = gid;
+    const cut = gid.search(/-(sec|vol|part|chap|subchap|Pg|pt|art)\b/);
+    // packages are like USCODE-2008-title28 or WCPD-2008-07-14 (date packages have no granule)
+    const mTitle = gid.match(/^([A-Z]+-\d{4}(?:-\d{2}-\d{2})?(?:-title\d+(?:-vol\d+)?)?)/);
+    if (cut !== -1 && mTitle) pkg = mTitle[1];
+    else if (cut !== -1) pkg = gid.slice(0, cut);
+
+    const KEY = GOVINFO_KEY ? "?api_key=" + encodeURIComponent(GOVINFO_KEY) : "";
+    // 1) the API text endpoints are the reliable source (raw text, not the nav page)
+    const apiTries = [
+      "https://api.govinfo.gov/packages/" + gid + "/htm" + KEY,        // granule-as-package
+      "https://api.govinfo.gov/packages/" + pkg + "/htm" + KEY,        // package text
+    ];
+    // 2) content-file paths as a fallback: pkg in path, granule in filename
+    const contentTries = [
       "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm",
       "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm",
     ];
-    let raw = "";
-    for (const u of candidates) {
-      try { raw = await tfetch(u, 18000); if (raw) break; } catch (e) { /* try next */ }
+
+    function looksLikeChrome(t) {
+      // the details page is all navigation; reject it
+      const head = t.slice(0, 1500).toLowerCase();
+      return head.indexOf("skip to main content") !== -1 ||
+        (head.indexOf("browse a to z") !== -1 && head.indexOf("\u00a7") === -1) ||
+        head.indexOf("<!doctype html") !== -1 && head.indexOf("govinfo") !== -1 && t.length < 4000;
     }
-    if (!raw) {
+    function clean(raw) {
+      let txt = raw.replace(/<head[\s\S]*?<\/head>/i, "")
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<\/(p|div|h\d|tr|li|pre)>/gi, "\n")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+        .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+      return txt;
+    }
+
+    let txt = "";
+    for (const u of apiTries.concat(contentTries)) {
+      try {
+        const raw = await tfetch(u, 18000);
+        if (!raw) continue;
+        if (looksLikeChrome(raw)) continue; // skip the nav page
+        const c = clean(raw);
+        if (c && c.length > 80) { txt = c; break; }
+      } catch (e) { /* try next */ }
+    }
+    if (!txt) {
       const e = new Error("nohtml"); e.nohtml = true;
       e.detail = "https://www.govinfo.gov/app/details/" + pkg;
       throw e;
     }
-    // govinfo htm is often a <pre> block; strip tags, keep the text
-    let txt = raw.replace(/<head[\s\S]*?<\/head>/i, "")
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<\/(p|div|h\d|tr|li)>/gi, "\n")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
-      .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     return { id: gid, text: txt.slice(0, 1200000),
       detail: "https://www.govinfo.gov/app/details/" + pkg };
   }
