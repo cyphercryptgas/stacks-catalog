@@ -445,6 +445,7 @@ function startServer() {
   // ---- The Annex: research papers (arXiv) and case law (CourtListener) ----
   const ARXIV_BASE = (process.env.ARXIV_BASE || "http://export.arxiv.org").replace(/\/+$/, "");
   const CL_BASE = (process.env.COURTLISTENER_BASE || "https://www.courtlistener.com").replace(/\/+$/, "");
+  const GOVINFO_KEY = process.env.GOVINFO_KEY || "";
   const ANNEX_DIR = path.join(DATA_DIR, "annex");
   const tagOf = (xml, tag) => {
     const m = xml.match(new RegExp("<" + tag + "[^>]*>([\\s\\S]*?)</" + tag + ">"));
@@ -457,6 +458,19 @@ function startServer() {
     const tm = setTimeout(() => ctl.abort(), ms || 20000);
     try {
       const r = await fetch(url, { signal: ctl.signal, headers: UA });
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+      return await r.text();
+    } finally { clearTimeout(tm); }
+  }
+  async function tfetchPost(url, body, ms) {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), ms || 20000);
+    try {
+      const r = await fetch(url, {
+        method: "POST", signal: ctl.signal,
+        headers: Object.assign({ "Content-Type": "application/json" }, UA),
+        body,
+      });
       if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
       return await r.text();
     } finally { clearTimeout(tm); }
@@ -500,21 +514,72 @@ function startServer() {
     return { docs: docs.slice(0, 20) };
   }
   async function lawSearch(qstr) {
-    const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
-      encodeURIComponent(qstr), 20000));
     const docs = [];
-    for (const r of (j.results || []).slice(0, 20)) {
-      const op = (r.opinions && r.opinions[0]) || {};
-      docs.push({
-        id: op.id || null,
-        title: r.caseName || r.case_name || "Untitled case",
-        court: r.court_citation_string || r.court || "",
-        year: ((r.dateFiled || r.date_filed || "").match(/^(\d{4})/) || [])[1] || null,
-        cite: Array.isArray(r.citation) ? r.citation.slice(0, 2).join(" \u00b7 ") : (r.citation || ""),
-        url: r.absolute_url ? CL_BASE + r.absolute_url : null,
-      });
-    }
-    return { docs };
+    // 1) opinions (case law)
+    try {
+      const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
+        encodeURIComponent(qstr), 18000));
+      for (const r of (j.results || []).slice(0, 12)) {
+        const op = (r.opinions && r.opinions[0]) || {};
+        docs.push({
+          kind: "opinion",
+          id: op.id || null,
+          title: r.caseName || r.case_name || "Untitled case",
+          court: r.court_citation_string || r.court || "",
+          year: ((r.dateFiled || r.date_filed || "").match(/^(\d{4})/) || [])[1] || null,
+          cite: Array.isArray(r.citation) ? r.citation.slice(0, 2).join(" \u00b7 ") : (r.citation || ""),
+          url: r.absolute_url ? CL_BASE + r.absolute_url : null,
+        });
+      }
+    } catch (e) { /* opinions optional */ }
+    // 2) dockets (the lawsuits themselves)
+    try {
+      const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=r&order_by=score%20desc&q=" +
+        encodeURIComponent(qstr), 18000));
+      for (const r of (j.results || []).slice(0, 8)) {
+        const did = r.docket_id || r.id;
+        if (!did) continue;
+        docs.push({
+          kind: "docket",
+          id: "recap:" + did,
+          title: r.caseName || r.case_name || "Untitled docket",
+          court: (r.court || r.court_id || "") +
+            (r.docketNumber || r.docket_number ? " \u00b7 " + (r.docketNumber || r.docket_number) : ""),
+          year: ((r.dateFiled || r.date_filed || "").match(/^(\d{4})/) || [])[1] || null,
+          cite: "",
+          url: r.docket_absolute_url ? CL_BASE + r.docket_absolute_url : null,
+        });
+      }
+    } catch (e) { /* dockets optional */ }
+    // 3) statutes & regulations (govinfo full-text search across USCODE/CFR/PLAW)
+    try {
+      if (GOVINFO_KEY) {
+        const body = JSON.stringify({
+          query: qstr, pageSize: 8, offsetMark: "*",
+          collections: ["USCODE", "CFR", "PLAW"],
+          resultLevel: "default", historical: false,
+        });
+        const sj = JSON.parse(await tfetchPost(
+          "https://api.govinfo.gov/search?api_key=" + encodeURIComponent(GOVINFO_KEY),
+          body, 16000));
+        for (const r of (sj.results || []).slice(0, 8)) {
+          const pid = r.packageId || r.granuleId || "";
+          const coll = (r.collectionCode || "").toUpperCase();
+          docs.push({
+            kind: "statute",
+            id: pid,
+            title: (r.title || pid).slice(0, 200),
+            court: coll === "CFR" ? "Code of Federal Regulations"
+              : coll === "PLAW" ? "Public Law" : "United States Code",
+            year: (r.dateIssued || "").slice(0, 4) || null,
+            cite: "",
+            url: pid ? "https://www.govinfo.gov/app/details/" + pid : null,
+            pdf: pid ? "https://www.govinfo.gov/content/pkg/" + pid + "/html/" + pid + ".htm" : null,
+          });
+        }
+      }
+    } catch (e) { /* statutes optional */ }
+    return { docs: docs.slice(0, 28) };
   }
   async function lawCase(id) {
     const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + id + "/?format=json", 20000));
