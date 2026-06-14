@@ -14,6 +14,12 @@ on:
       per_court:
         description: "Opinions per court (law; 640 per room)"
         default: "2560"
+      per_subject:
+        description: "DOAB books per subject hall (research books)"
+        default: "640"
+      per_title:
+        description: "Sections per U.S. Code title (law statutes)"
+        default: "1920"
   schedule:
     - cron: "20 7 3 * *" # monthly, the 3rd at 07:20 UTC
 
@@ -46,6 +52,15 @@ jobs:
           OUT: research.db
         run: python scripts/build_wing_research.py
 
+      - name: Append research books (OpenStax + DOAB)
+        id: research_books
+        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research') && steps.research.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          PER_SUBJECT: ${{ inputs.per_subject || '640' }}
+          OUT: research.db
+        run: python scripts/append_research_books.py
+
       - name: Build law library (CourtListener)
         id: law
         if: ${{ github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law' }}
@@ -55,6 +70,16 @@ jobs:
           CL_TOKEN: ${{ secrets.CL_TOKEN }}
           OUT: law.db
         run: python scripts/build_wing_law.py
+
+      - name: Append law statutes (U.S. Code + CFR)
+        id: law_statutes
+        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          PER_TITLE: ${{ inputs.per_title || '1920' }}
+          GOVINFO_KEY: ${{ secrets.GOVINFO_KEY }}
+          OUT: law.db
+        run: python scripts/append_law_statutes.py
 
       - name: Publish to the release
         run: |
