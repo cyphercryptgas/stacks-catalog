@@ -454,11 +454,17 @@ function startServer() {
       .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
       .replace(/\s+/g, " ").trim() : "";
   };
+  const CL_TOKEN = process.env.CL_TOKEN || "";
   async function tfetch(url, ms) {
     const ctl = new AbortController();
     const tm = setTimeout(() => ctl.abort(), ms || 20000);
     try {
-      const r = await fetch(url, { signal: ctl.signal, headers: UA });
+      const headers = Object.assign({}, UA);
+      // CourtListener increasingly requires auth even for reads; send the token.
+      if (CL_TOKEN && url.indexOf("courtlistener.com") !== -1) {
+        headers.Authorization = "Token " + CL_TOKEN;
+      }
+      const r = await fetch(url, { signal: ctl.signal, headers });
       if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
       return await r.text();
     } finally { clearTimeout(tm); }
