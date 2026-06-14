@@ -34,8 +34,21 @@ COURTS = [
     ("ca9", "Ninth Circuit"), ("ca10", "Tenth Circuit"),
     ("ca11", "Eleventh Circuit"), ("cadc", "D.C. Circuit"),
     ("cafc", "Federal Circuit"),
+    # state high courts — the most-cited state supreme courts
     ("cal", "Supreme Court of California"),
     ("ny", "New York Court of Appeals"),
+    ("tex", "Supreme Court of Texas"),
+    ("fla", "Supreme Court of Florida"),
+    ("ill", "Supreme Court of Illinois"),
+    ("mass", "Supreme Judicial Court of Massachusetts"),
+    ("pa", "Supreme Court of Pennsylvania"),
+    ("ohio", "Supreme Court of Ohio"),
+    ("nj", "Supreme Court of New Jersey"),
+    ("wash", "Supreme Court of Washington"),
+    ("mich", "Supreme Court of Michigan"),
+    ("ga", "Supreme Court of Georgia"),
+    ("va", "Supreme Court of Virginia"),
+    ("nc", "Supreme Court of North Carolina"),
 ]
 
 
