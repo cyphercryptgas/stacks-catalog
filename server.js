@@ -147,6 +147,10 @@ function startServer() {
         qRoom: wdb.prepare(
           "SELECT * FROM works WHERE si = ? AND rank >= ? AND rank < ? ORDER BY rank"),
       };
+      // pre-cached full texts (opinions), if the builder wrote a bodies table
+      try {
+        wings[w].qBody = wdb.prepare("SELECT text FROM bodies WHERE id = ?");
+      } catch (e) { wings[w].qBody = null; }
       console.log("wing open: " + w + " \u2014 " + wings[w].subjects.length + " halls");
     } catch (e) {
       console.log("wing " + w + " failed to open: " + e.message);
@@ -659,23 +663,37 @@ function startServer() {
     return text.trim();
   }
   async function lawCase(id) {
-    // try as an opinion id first
+    // 1) pre-cached in the law wing DB? serve instantly, no live call.
+    try {
+      const lw = wings.law;
+      if (lw && lw.qBody) {
+        const hit = lw.qBody.get(String(id));
+        if (hit && hit.text) return { id, text: hit.text, cached: true };
+      }
+    } catch (e) { /* fall through to live fetch */ }
+    // 2) live fetch (opinion id, then cluster fallback)
     let text = "";
     try {
       const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + id + "/?format=json", 20000));
       text = await clOpinionText(j);
     } catch (e1) {
-      // maybe it's a cluster id: fetch the cluster, then its lead sub-opinion
+      if (String(e1.message).indexOf("HTTP 429") !== -1) {
+        const err = new Error("RATELIMIT");
+        err.rate = true;
+        throw err;
+      }
       try {
         const c = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/clusters/" + id + "/?format=json", 18000));
         const subs = c.sub_opinions || [];
-        const first = subs[0] || "";
-        const opId = String(first).match(/opinions\/(\d+)\//);
+        const opId = String(subs[0] || "").match(/opinions\/(\d+)\//);
         if (opId) {
           const j2 = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/opinions/" + opId[1] + "/?format=json", 18000));
           text = await clOpinionText(j2);
         }
       } catch (e2) {
+        if (String(e2.message).indexOf("HTTP 429") !== -1) {
+          const err = new Error("RATELIMIT"); err.rate = true; throw err;
+        }
         throw new Error("opinion " + id + " unavailable (" + (e1.message || e2.message) + ")");
       }
     }
@@ -741,8 +759,52 @@ function startServer() {
     return { id, text: lines.join("\n").slice(0, 1200000), caseName };
   }
 
+  async function lawStatute(id) {
+    // id is a govinfo package or granule id (USCODE-.../CFR-.../PLAW-...).
+    // Fetch the htm content and clean it for the typeset reader.
+    const gid = String(id);
+    const pkg = gid.indexOf("-vol") !== -1 ? gid.split("-").slice(0, 4).join("-")
+      : gid.replace(/-sec.*$/, "");
+    // try granule htm first, then package htm
+    const candidates = [
+      "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm",
+      "https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm",
+    ];
+    let raw = "";
+    for (const u of candidates) {
+      try { raw = await tfetch(u, 18000); if (raw) break; } catch (e) { /* try next */ }
+    }
+    if (!raw) {
+      const e = new Error("nohtml"); e.nohtml = true;
+      e.detail = "https://www.govinfo.gov/app/details/" + pkg;
+      throw e;
+    }
+    // govinfo htm is often a <pre> block; strip tags, keep the text
+    let txt = raw.replace(/<head[\s\S]*?<\/head>/i, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<\/(p|div|h\d|tr|li)>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+      .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    return { id: gid, text: txt.slice(0, 1200000),
+      detail: "https://www.govinfo.gov/app/details/" + pkg };
+  }
   function annexRoute(kind, q, res) {
     const qstr = String(q.searchParams.get("q") || "").trim().slice(0, 160);
+    if (kind === "statute") {
+      const id = String(q.searchParams.get("id") || "").replace(/[^A-Za-z0-9\-]/g, "").slice(0, 80);
+      if (!id) return send(res, 400, { error: "id required" }, true);
+      const file = path.join(ANNEX_DIR, "statute-" + id + ".json");
+      const hit = annexCache(file);
+      if (hit) return send(res, 200, hit);
+      return lawStatute(id).then((out) => { annexSave(file, out); send(res, 200, out); })
+        .catch((e) => e && e.nohtml
+          ? send(res, 200, { id, text: "", detail: e.detail })
+          : send(res, 502, { error: "statute fetch failed: " + e.message }, true));
+    }
     if (kind === "docket") {
       const id = String(q.searchParams.get("id") || "").replace(/[^0-9]/g, "").slice(0, 12);
       if (!id) return send(res, 400, { error: "id required" }, true);
@@ -759,7 +821,9 @@ function startServer() {
       const hit = annexCache(file);
       if (hit) return send(res, 200, hit);
       return lawCase(id).then((out) => { annexSave(file, out); send(res, 200, out); })
-        .catch((e) => send(res, 502, { error: "case fetch failed: " + e.message }, true));
+        .catch((e) => e && e.rate
+          ? send(res, 429, { error: "the law library is busy \u2014 try again in a moment" }, true)
+          : send(res, 502, { error: "case fetch failed: " + e.message }, true));
     }
     if (qstr.length < 2) return send(res, 400, { error: "q required" }, true);
     const slug = qstr.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 70);
@@ -796,6 +860,7 @@ function startServer() {
     "/annex/papers": (q, res) => annexRoute("papers", q, res),
     "/annex/law": (q, res) => annexRoute("law", q, res),
     "/annex/case": (q, res) => annexRoute("case", q, res),
+    "/annex/statute": (q, res) => annexRoute("statute", q, res),
     "/annex/docket": (q, res) => annexRoute("docket", q, res),
     "/audio/resolve": (q, res) => audioRoute(q, res),
     "/gutenberg-find": (q, res) => {
