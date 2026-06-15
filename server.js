@@ -94,7 +94,7 @@ async function bootstrap() {
   console.log("index ready: " + (fs.statSync(DB_PATH).size / 1e9).toFixed(2) + " GB");
 }
 
-const WING_NAMES = ["research", "law"];
+const WING_NAMES = ["research", "law", "audio"];
 
 async function bootstrapWings() {
   let wj = null;
@@ -135,6 +135,7 @@ function startServer() {
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
   const wings = {};
   for (const w of WING_NAMES) {
+    if (w === "audio") continue; // audio.db has its own schema, opened separately below
     const p = path.join(DATA_DIR, w + ".db");
     if (!fs.existsSync(p)) continue;
     try {
@@ -160,6 +161,28 @@ function startServer() {
     db.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
   const SUBJECTS = JSON.parse(metaRows.subjects || "[]");
   const subjectCounts = JSON.parse(metaRows.subject_counts || "{}");
+
+  // ---- LibriVox audiobook index (audio.db), if present ----
+  let audioDB = null, qAudio = null, qAudioNt = null, audioMeta = {};
+  try {
+    const ap = path.join(DATA_DIR, "audio.db");
+    if (fs.existsSync(ap)) {
+      audioDB = new DatabaseSync(ap, { readOnly: true });
+      qAudio = audioDB.prepare("SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt = ? AND (sn = ? OR sn = '') LIMIT 1");
+      qAudioNt = audioDB.prepare("SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt = ? LIMIT 1");
+      audioMeta = Object.fromEntries(audioDB.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
+      console.log("audio index open: " + (audioMeta.count || "?") + " audiobooks");
+    }
+  } catch (e) { console.log("audio index failed to open: " + e.message); audioDB = null; }
+  function audioHas(title, author) {
+    if (!audioDB) return null;
+    const nt = normTitle(title), sn = surname(author);
+    if (!nt) return null;
+    let hit = null;
+    try { hit = sn ? qAudio.get(nt, sn) : qAudioNt.get(nt); } catch (e) { return null; }
+    if (!hit && sn) { try { hit = qAudioNt.get(nt); } catch (e) {} }
+    return hit || null;
+  }
 
   const qRoom = db.prepare(
     "SELECT w.* FROM subject_rank sr JOIN works w ON w.id = sr.wid " +
@@ -881,6 +904,18 @@ function startServer() {
     "/annex/statute": (q, res) => annexRoute("statute", q, res),
     "/annex/docket": (q, res) => annexRoute("docket", q, res),
     "/audio/resolve": (q, res) => audioRoute(q, res),
+    "/audio/check": (q, res) => {
+      // GET ?q=title1|author1;;title2|author2;; ...  -> array of 0/1 has-audio flags
+      const raw = q.searchParams.get("q") || "";
+      const items = raw.split(";;").filter(Boolean);
+      const out = items.map((it) => {
+        const [t, a] = it.split("|");
+        return audioHas(t || "", a || "") ? 1 : 0;
+      });
+      send(res, 200, { has: out, indexed: !!audioDB }, true);
+    },
+    "/audio/indexed": (q, res) => send(res, 200,
+      { indexed: !!audioDB, count: Number(audioMeta.count || 0), built: audioMeta.built || "" }, true),
     "/gutenberg-find": (q, res) => {
       const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
       const author = String(q.searchParams.get("author") || "").slice(0, 120).trim();
