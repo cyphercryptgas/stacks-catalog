@@ -383,10 +383,65 @@ function startServer() {
     };
   }
 
+  async function lvById(id) {
+    // resolve a known LibriVox project straight from its id (what the index stores),
+    // so a book the index matched always resolves the same recording.
+    let b = null;
+    try {
+      const j = await jfetch(LV_BASE + "/api/feed/audiobooks/?format=json&extended=1&id=" + encodeURIComponent(id), 22000);
+      const books = (j && j.books) || [];
+      b = Array.isArray(books) ? books[0] : (books && books["0"]) || null;
+    } catch (e) { return { found: false }; }
+    if (!b) return { found: false };
+    let secs = Array.isArray(b.sections) ? b.sections : [];
+    if (!secs.length && b.id) {
+      try {
+        const t = await jfetch(LV_BASE + "/api/feed/audiotracks/?format=json&project_id=" + b.id, 20000);
+        secs = (t && (t.sections || t.audiotracks)) || [];
+      } catch (e) {}
+    }
+    const sections = secs.filter((s) => s && s.listen_url).slice(0, 300).map((s, i) => ({
+      n: Number(s.section_number) || i + 1,
+      title: s.title || ("Section " + (i + 1)),
+      url: s.listen_url,
+      playtime: s.playtime || null,
+    }));
+    if (!sections.length) return { found: false };
+    return {
+      found: true, id: b.id, title: b.title,
+      author: (b.authors && b.authors[0])
+        ? ((b.authors[0].first_name || "") + " " + (b.authors[0].last_name || "")).trim() : null,
+      totaltime: b.totaltime || null,
+      url: b.url_librivox || null,
+      sections,
+    };
+  }
+
   const lvInflight = new Map();
   function audioRoute(q, res) {
+    const lvid = String(q.searchParams.get("lvid") || "").replace(/[^0-9]/g, "").slice(0, 12);
     const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
     const author = String(q.searchParams.get("author") || "").slice(0, 120).trim();
+    // direct id resolution (from the index) takes priority — always consistent
+    if (lvid) {
+      const file = path.join(AUDIO_DIR, "lvid-" + lvid + ".json");
+      if (fs.existsSync(file)) {
+        try { return send(res, 200, JSON.parse(fs.readFileSync(file, "utf8"))); } catch (e) {}
+      }
+      const key = "id:" + lvid;
+      let p = lvInflight.get(key);
+      if (!p) {
+        p = lvById(lvid).then((out) => {
+          fs.mkdirSync(AUDIO_DIR, { recursive: true });
+          fs.writeFileSync(file, JSON.stringify(out));
+          if (out.found) console.log("librivox by id #" + lvid + " (" + out.sections.length + " sections)");
+          return out;
+        }).finally(() => lvInflight.delete(key));
+        lvInflight.set(key, p);
+      }
+      return p.then((out) => send(res, 200, out))
+        .catch((e) => send(res, 502, { error: "librivox lookup failed: " + e.message }, true));
+    }
     if (title.length < 2) return send(res, 400, { error: "title required" }, true);
     const slug = slugOf(title, author);
     const file = path.join(AUDIO_DIR, "lv-" + slug + ".json");
@@ -905,14 +960,18 @@ function startServer() {
     "/annex/docket": (q, res) => annexRoute("docket", q, res),
     "/audio/resolve": (q, res) => audioRoute(q, res),
     "/audio/check": (q, res) => {
-      // GET ?q=title1|author1;;title2|author2;; ...  -> array of 0/1 has-audio flags
+      // GET ?q=title1|author1;;title2|author2;; ...
+      // -> { has:[0/1...], ids:[lvid or 0...] } so the reader can resolve by id
       const raw = q.searchParams.get("q") || "";
       const items = raw.split(";;").filter(Boolean);
-      const out = items.map((it) => {
+      const has = [], ids = [];
+      for (const it of items) {
         const [t, a] = it.split("|");
-        return audioHas(t || "", a || "") ? 1 : 0;
-      });
-      send(res, 200, { has: out, indexed: !!audioDB }, true);
+        const hit = audioHas(t || "", a || "");
+        has.push(hit ? 1 : 0);
+        ids.push(hit && hit.id ? hit.id : 0);
+      }
+      send(res, 200, { has, ids, indexed: !!audioDB }, true);
     },
     "/audio/indexed": (q, res) => send(res, 200,
       { indexed: !!audioDB, count: Number(audioMeta.count || 0), built: audioMeta.built || "" }, true),
