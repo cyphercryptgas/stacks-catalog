@@ -36,6 +36,46 @@ MAX_OFFSET = int(os.environ.get("LV_MAX_OFFSET", "14000"))
 UA = "HexadecagonLibrary/1.0 (+https://github.com/cyphercryptgas/stacks-catalog)"
 STOP = {"the", "a", "an", "or", "and"}
 
+# Map LibriVox genre strings to the library's 8 broad categories. LibriVox genres
+# are hierarchical (e.g. "Children's Fiction > Action & Adventure"); we match on
+# keywords so the whole tree collapses into the same eight shelves the books use.
+CATEGORY_RULES = [
+    ("For Younger Readers", ["children", "juvenile", "young adult"]),
+    ("Mind & Society", ["political", "politic", "economic", "econom", "social science",
+                        "sociolog", "law", "jurisprud", "business", "education",
+                        "society", "war & military", "reference", "essays"]),
+    ("Stories & Verse", ["fiction", "poetry", "drama", "fantasy", "fairy",
+                          "humor", "satire", "romance", "horror", "adventure",
+                          "literature", "short stories", "epic", "tragedy", "saga",
+                          "nautical", "western", "crime", "mystery", "detective",
+                          "action", "ballad", "verse", "play"]),
+    ("Lives & History", ["biography", "memoir", "autobiograph", "history", "historical",
+                          "letters", "diary", "antiquity"]),
+    ("Thought & Belief", ["religion", "philosophy", "ethic", "christ", "bible",
+                          "spiritual", "theolog", "sacred", "buddh", "islam",
+                          "myth", "psycholog", "self-help"]),
+    ("Science & Nature", ["science", "nature", "natural history", "physic", "chemistr",
+                          "biolog", "astronom", "math", "medic", "technolog", "animal",
+                          "botan", "geolog", "engineering"]),
+    ("Living & Place", ["travel", "cook", "garden", "health", "geograph", "sport",
+                        "exploration", "house", "domestic", "craft"]),
+    ("Art & Culture", ["art", "music", "architect", "photograph", "paint", "theater",
+                       "theatre", "design", "language", "culture"]),
+]
+
+
+def category_for(genres):
+    """Pick the best-fitting library category for a list of LibriVox genre strings."""
+    blob = " ".join(genres).lower()
+    if not blob:
+        return ""
+    # children's takes priority so juvenile fiction doesn't fall into Stories & Verse
+    for cat, keys in CATEGORY_RULES:
+        for k in keys:
+            if k in blob:
+                return cat
+    return ""
+
 
 def norm_title(s):
     s = (s or "").lower()
@@ -74,15 +114,16 @@ def main():
         "PRAGMA journal_mode=WAL;"
         "CREATE TABLE IF NOT EXISTS audiobooks("
         " nt TEXT, sn TEXT, id INTEGER, title TEXT, author TEXT,"
-        " url TEXT, totaltime TEXT, sections INTEGER,"
+        " url TEXT, totaltime TEXT, sections INTEGER, cat TEXT,"
         " PRIMARY KEY(nt, sn));"
         "CREATE INDEX IF NOT EXISTS ix_nt ON audiobooks(nt);"
+        "CREATE INDEX IF NOT EXISTS ix_cat ON audiobooks(cat);"
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);")
 
     total = 0
     offset = 0
     while offset <= MAX_OFFSET:
-        url = (LV_BASE + "/api/feed/audiobooks/?format=json&limit=%d&offset=%d"
+        url = (LV_BASE + "/api/feed/audiobooks/?format=json&extended=1&limit=%d&offset=%d"
                % (LIMIT, offset))
         try:
             j = get(url)
@@ -110,12 +151,18 @@ def main():
             sn = surname(author)
             if not nt:
                 continue
+            genres = []
+            for g in (b.get("genres") or []):
+                name = g.get("name") if isinstance(g, dict) else g
+                if name:
+                    genres.append(str(name))
+            cat = category_for(genres)
             rows.append((nt, sn, b.get("id"), title[:300], author[:200],
                          b.get("url_librivox") or None, b.get("totaltime") or None,
-                         int(b.get("num_sections") or 0)))
+                         int(b.get("num_sections") or 0), cat))
         if rows:
             con.executemany(
-                "INSERT OR REPLACE INTO audiobooks VALUES(?,?,?,?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO audiobooks VALUES(?,?,?,?,?,?,?,?,?)", rows)
             con.commit()
             total += len(rows)
         print("offset %5d  +%3d english  (total %d)" % (offset, len(rows), total), flush=True)
