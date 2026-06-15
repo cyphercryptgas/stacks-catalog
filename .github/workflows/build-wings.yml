@@ -94,6 +94,14 @@ jobs:
           OUT: law.db
         run: python scripts/append_law_dockets.py
 
+      - name: Build LibriVox audiobook index
+        id: audio
+        continue-on-error: true
+        env:
+          LV_PAUSE: "4"
+          DATA_DIR: "."
+        run: python scripts/build_audio_index.py
+
       - name: Publish to the release
         run: |
           set -e
@@ -107,7 +115,7 @@ jobs:
           except Exception:
               wings = {}
           published = []
-          for name in ("research", "law"):
+          for name in ("research", "law", "audio"):
               db = name + ".db"
               if not os.path.exists(db) or os.path.getsize(db) < 4096:
                   print("skip", name, "(no usable db)")
@@ -123,6 +131,7 @@ jobs:
           ASSETS="wings.json"
           [ -f research.db.gz ] && ASSETS="$ASSETS research.db.gz"
           [ -f law.db.gz ] && ASSETS="$ASSETS law.db.gz"
+          [ -f audio.db.gz ] && ASSETS="$ASSETS audio.db.gz"
           if [ "$ASSETS" = "wings.json" ]; then
             echo "Neither wing built — nothing to publish."; exit 1
           fi
