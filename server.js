@@ -562,19 +562,38 @@ function startServer() {
       .replace(/\s+/g, " ").trim() : "";
   };
   const CL_TOKEN = process.env.CL_TOKEN || "";
-  async function tfetch(url, ms) {
-    const ctl = new AbortController();
-    const tm = setTimeout(() => ctl.abort(), ms || 20000);
-    try {
-      const headers = Object.assign({}, UA);
-      // CourtListener increasingly requires auth even for reads; send the token.
-      if (CL_TOKEN && url.indexOf("courtlistener.com") !== -1) {
-        headers.Authorization = "Token " + CL_TOKEN;
-      }
-      const r = await fetch(url, { signal: ctl.signal, headers });
-      if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
-      return await r.text();
-    } finally { clearTimeout(tm); }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function tfetch(url, ms, opts) {
+    const isCL = url.indexOf("courtlistener.com") !== -1;
+    // CourtListener throttles by burst rate; on 429 wait (honoring Retry-After) and
+    // retry a couple of times before giving up. Other hosts fail fast as before.
+    const maxTries = (opts && opts.retries != null) ? opts.retries : (isCL ? 3 : 1);
+    let lastErr = null;
+    for (let attempt = 0; attempt < maxTries; attempt++) {
+      const ctl = new AbortController();
+      const tm = setTimeout(() => ctl.abort(), ms || 20000);
+      try {
+        const headers = Object.assign({}, UA);
+        if (CL_TOKEN && isCL) headers.Authorization = "Token " + CL_TOKEN;
+        const r = await fetch(url, { signal: ctl.signal, headers });
+        if (r.status === 429 && attempt < maxTries - 1) {
+          // respect Retry-After (seconds) if present, else exponential-ish backoff
+          const ra = parseInt(r.headers.get("retry-after") || "", 10);
+          const waitMs = (!isNaN(ra) && ra > 0) ? Math.min(ra * 1000, 8000)
+            : 1200 * (attempt + 1) + Math.floor(Math.random() * 400);
+          clearTimeout(tm);
+          await sleep(waitMs);
+          continue;
+        }
+        if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+        return await r.text();
+      } catch (e) {
+        lastErr = e;
+        // only retry on 429; abort/network errors fail immediately
+        if (String(e.message || "").indexOf("HTTP 429") === -1) { clearTimeout(tm); throw e; }
+      } finally { clearTimeout(tm); }
+    }
+    throw lastErr || new Error("request failed " + url);
   }
   async function tfetchPost(url, body, ms) {
     const ctl = new AbortController();
@@ -679,6 +698,7 @@ function startServer() {
   }
   async function lawSearch(qstr) {
     const docs = [];
+    let rateLimited = false;
     // 1) opinions (case law)
     try {
       const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
@@ -695,7 +715,7 @@ function startServer() {
           url: r.absolute_url ? CL_BASE + r.absolute_url : null,
         });
       }
-    } catch (e) { /* opinions optional */ }
+    } catch (e) { if (String(e.message || "").indexOf("HTTP 429") !== -1) rateLimited = true; }
     // 2) dockets (the lawsuits themselves)
     try {
       const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=r&order_by=score%20desc&q=" +
@@ -714,7 +734,7 @@ function startServer() {
           url: r.docket_absolute_url ? CL_BASE + r.docket_absolute_url : null,
         });
       }
-    } catch (e) { /* dockets optional */ }
+    } catch (e) { if (String(e.message || "").indexOf("HTTP 429") !== -1) rateLimited = true; }
     // 3) statutes & regulations (govinfo full-text search across USCODE/CFR/PLAW)
     try {
       if (GOVINFO_KEY) {
@@ -735,6 +755,12 @@ function startServer() {
           const prefix = (pid.split("-")[0] || "").toUpperCase();
           // only keep the three statute collections; skip anything else that slips through
           if (["USCODE", "CFR", "PLAW"].indexOf(prefix) === -1) continue;
+          // skip table-of-contents / front-matter granules — they have no section text
+          // and only resolve to a govinfo landing page, not an actual law
+          const idForCheck = (gid || pid).toLowerCase();
+          if (/-toc$|-toc-|-front$|-frontmatter|tableofcontents/.test(idForCheck)) continue;
+          const titleLc = (r.title || "").toLowerCase().trim();
+          if (titleLc === "table of contents" || titleLc === "front matter") continue;
           const pkgId = r.packageId || (gid ? gid.split("-sec")[0].split("-vol")[0] : pid);
           const detailUrl = gid && r.packageId
             ? "https://www.govinfo.gov/app/details/" + r.packageId + "/" + gid
@@ -753,7 +779,7 @@ function startServer() {
         }
       }
     } catch (e) { /* statutes optional */ }
-    return { docs: docs.slice(0, 28) };
+    return { docs: docs.slice(0, 28), rateLimited: rateLimited && docs.length === 0 };
   }
   async function clOpinionText(j) {
     let text = j.plain_text || "";
@@ -952,8 +978,12 @@ function startServer() {
     const hit = annexCache(file);
     if (hit) return send(res, 200, hit);
     const p = kind === "papers" ? researchSearch(qstr) : lawSearch(qstr);
-    p.then((out) => { annexSave(file, out); send(res, 200, out); })
-      .catch((e) => send(res, 502, { error: kind + " search failed: " + e.message }, true));
+    p.then((out) => {
+      // only cache real, non-empty results; never cache a rate-limited or empty miss,
+      // or the failure sticks even after CourtListener's throttle clears
+      if (out && out.docs && out.docs.length && !out.rateLimited) annexSave(file, out);
+      send(res, 200, out);
+    }).catch((e) => send(res, 502, { error: kind + " search failed: " + e.message }, true));
   }
 
   const routes = {
