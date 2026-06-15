@@ -170,6 +170,14 @@ function startServer() {
       audioDB = new DatabaseSync(ap, { readOnly: true });
       qAudio = audioDB.prepare("SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt = ? AND (sn = ? OR sn = '') LIMIT 1");
       qAudioNt = audioDB.prepare("SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt = ? LIMIT 1");
+      // browse the whole catalogue A-Z (nt already drops leading the/a/an), paginated
+      audioDB._qBrowse = audioDB.prepare(
+        "SELECT id, title, author, url, totaltime, sections FROM audiobooks ORDER BY nt LIMIT ? OFFSET ?");
+      audioDB._qBrowseLetter = audioDB.prepare(
+        "SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt LIKE ? ORDER BY nt LIMIT ? OFFSET ?");
+      audioDB._qSearch = audioDB.prepare(
+        "SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt LIKE ? OR author LIKE ? ORDER BY nt LIMIT ?");
+      audioDB._qTotal = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks");
       audioMeta = Object.fromEntries(audioDB.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
       console.log("audio index open: " + (audioMeta.count || "?") + " audiobooks");
     }
@@ -975,6 +983,36 @@ function startServer() {
     },
     "/audio/indexed": (q, res) => send(res, 200,
       { indexed: !!audioDB, count: Number(audioMeta.count || 0), built: audioMeta.built || "" }, true),
+    "/audio/browse": (q, res) => {
+      // browse the full LibriVox catalogue: A-Z, paginated, optional letter or search
+      if (!audioDB) return send(res, 200, { books: [], total: 0, indexed: false }, true);
+      const page = Math.max(0, parseInt(q.searchParams.get("page"), 10) || 0);
+      const per = Math.max(1, Math.min(100, parseInt(q.searchParams.get("per"), 10) || 50));
+      const letter = String(q.searchParams.get("letter") || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 1);
+      const search = String(q.searchParams.get("q") || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").trim().slice(0, 80);
+      let rows = [], total = 0;
+      try {
+        if (search) {
+          rows = audioDB._qSearch.all("%" + search + "%", "%" + search + "%", per);
+          total = rows.length;
+        } else if (letter) {
+          rows = audioDB._qBrowseLetter.all(letter + "%", per, page * per);
+          // count for this letter
+          const c = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks WHERE nt LIKE ?").get(letter + "%");
+          total = c ? c.n : rows.length;
+        } else {
+          rows = audioDB._qBrowse.all(per, page * per);
+          const c = audioDB._qTotal.get();
+          total = c ? c.n : 0;
+        }
+      } catch (e) { return send(res, 502, { error: "audio browse failed: " + e.message }, true); }
+      const books = rows.map((r) => ({
+        title: r.title, author: r.author, lvid: r.id,
+        totaltime: r.totaltime, sections: r.sections,
+        url: r.url, hasAudio: true,
+      }));
+      send(res, 200, { books, total, page, per, indexed: true }, true);
+    },
     "/gutenberg-find": (q, res) => {
       const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
       const author = String(q.searchParams.get("author") || "").slice(0, 120).trim();
