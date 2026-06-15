@@ -143,6 +143,7 @@ function startServer() {
       const wm = Object.fromEntries(
         wdb.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
       wings[w] = {
+        db: wdb,
         subjects: JSON.parse(wm.subjects || "[]"),
         built: wm.built || "", version: wm.version || "",
         qRoom: wdb.prepare(
@@ -1052,6 +1053,57 @@ function startServer() {
         .catch((e) => send(res, 502, { error: "pg catalog lookup failed: " + e.message }, true));
     },
     "/health": (q, res) => send(res, 200, { ok: true }, true),
+    "/debug/law": (q, res) => {
+      // diagnostics: is the bodies pre-cache populated? does a given id resolve?
+      const out = { lawOpen: !!wings.law, hasBodies: false, bodyCount: 0, sampleIds: [], worksCount: 0 };
+      try {
+        const lw = wings.law;
+        if (lw && lw.db) {
+          try {
+            const c = lw.db.prepare("SELECT COUNT(*) AS n FROM bodies").get();
+            out.hasBodies = true; out.bodyCount = c ? c.n : 0;
+            out.sampleIds = lw.db.prepare("SELECT id FROM bodies LIMIT 8").all().map((r) => r.id);
+          } catch (e) { out.bodiesError = e.message; }
+          try {
+            const w = lw.db.prepare("SELECT COUNT(*) AS n FROM works").get();
+            out.worksCount = w ? w.n : 0;
+            out.sampleWorks = lw.db.prepare("SELECT id, title FROM works WHERE id != '' ORDER BY rank LIMIT 5").all();
+          } catch (e) { out.worksError = e.message; }
+        }
+      } catch (e) { out.error = e.message; }
+      // optional: ?id=NNN checks whether that opinion id is pre-cached
+      const id = String(q.searchParams.get("id") || "").replace(/[^0-9]/g, "");
+      if (id && wings.law && wings.law.qBody) {
+        try {
+          const hit = wings.law.qBody.get(id);
+          out.idCheck = { id, cached: !!(hit && hit.text), len: hit && hit.text ? hit.text.length : 0 };
+        } catch (e) { out.idCheck = { id, error: e.message }; }
+      }
+      // optional: ?q=marbury runs a live CL search and reports the raw outcome
+      const probe = String(q.searchParams.get("q") || "").slice(0, 80);
+      if (probe) {
+        out.tokenSet = !!CL_TOKEN;
+        return tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
+          encodeURIComponent(probe), 18000)
+          .then((raw) => {
+            let parsed = null; try { parsed = JSON.parse(raw); } catch (e) {}
+            out.searchProbe = {
+              ok: true,
+              count: parsed && parsed.results ? parsed.results.length : 0,
+              firstId: parsed && parsed.results && parsed.results[0] && parsed.results[0].opinions
+                ? (parsed.results[0].opinions[0] || {}).id : null,
+              firstName: parsed && parsed.results && parsed.results[0]
+                ? (parsed.results[0].caseName || parsed.results[0].case_name) : null,
+            };
+            send(res, 200, out, true);
+          })
+          .catch((e) => {
+            out.searchProbe = { ok: false, error: String(e.message || e) };
+            send(res, 200, out, true);
+          });
+      }
+      send(res, 200, out, true);
+    },
     "/version": (q, res) => send(res, 200, {
       version: fs.existsSync(VER_PATH) ? fs.readFileSync(VER_PATH, "utf8").trim() : metaRows.built,
       built: metaRows.built,
