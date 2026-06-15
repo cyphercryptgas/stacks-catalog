@@ -178,6 +178,22 @@ function startServer() {
       audioDB._qSearch = audioDB.prepare(
         "SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE nt LIKE ? OR author LIKE ? ORDER BY nt LIMIT ?");
       audioDB._qTotal = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks");
+      // category support exists only if the index was built with the cat column
+      audioDB._hasCat = false;
+      try {
+        const cols = audioDB.prepare("PRAGMA table_info(audiobooks)").all();
+        audioDB._hasCat = cols.some((c) => c.name === "cat");
+      } catch (e) {}
+      if (audioDB._hasCat) {
+        audioDB._qCats = audioDB.prepare(
+          "SELECT cat, COUNT(*) AS n FROM audiobooks WHERE cat <> '' GROUP BY cat ORDER BY cat");
+        audioDB._qBrowseCat = audioDB.prepare(
+          "SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE cat = ? ORDER BY nt LIMIT ? OFFSET ?");
+        audioDB._qBrowseCatLetter = audioDB.prepare(
+          "SELECT id, title, author, url, totaltime, sections FROM audiobooks WHERE cat = ? AND nt LIKE ? ORDER BY nt LIMIT ? OFFSET ?");
+        audioDB._qCountCat = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks WHERE cat = ?");
+        audioDB._qCountCatLetter = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks WHERE cat = ? AND nt LIKE ?");
+      }
       audioMeta = Object.fromEntries(audioDB.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
       console.log("audio index open: " + (audioMeta.count || "?") + " audiobooks");
     }
@@ -983,21 +999,36 @@ function startServer() {
     },
     "/audio/indexed": (q, res) => send(res, 200,
       { indexed: !!audioDB, count: Number(audioMeta.count || 0), built: audioMeta.built || "" }, true),
+    "/audio/categories": (q, res) => {
+      if (!audioDB || !audioDB._hasCat) return send(res, 200, { categories: [], hasCat: false }, true);
+      let cats = [];
+      try { cats = audioDB._qCats.all().map((r) => ({ name: r.cat, count: r.n })); }
+      catch (e) { return send(res, 502, { error: "audio categories failed: " + e.message }, true); }
+      send(res, 200, { categories: cats, hasCat: true }, true);
+    },
     "/audio/browse": (q, res) => {
-      // browse the full LibriVox catalogue: A-Z, paginated, optional letter or search
+      // browse the full LibriVox catalogue: A-Z, paginated, optional letter/search/category
       if (!audioDB) return send(res, 200, { books: [], total: 0, indexed: false }, true);
       const page = Math.max(0, parseInt(q.searchParams.get("page"), 10) || 0);
       const per = Math.max(1, Math.min(100, parseInt(q.searchParams.get("per"), 10) || 50));
       const letter = String(q.searchParams.get("letter") || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 1);
       const search = String(q.searchParams.get("q") || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").trim().slice(0, 80);
+      const cat = audioDB._hasCat ? String(q.searchParams.get("cat") || "").slice(0, 60) : "";
       let rows = [], total = 0;
       try {
         if (search) {
           rows = audioDB._qSearch.all("%" + search + "%", "%" + search + "%", per);
           total = rows.length;
+        } else if (cat && letter) {
+          rows = audioDB._qBrowseCatLetter.all(cat, letter + "%", per, page * per);
+          const c = audioDB._qCountCatLetter.get(cat, letter + "%");
+          total = c ? c.n : rows.length;
+        } else if (cat) {
+          rows = audioDB._qBrowseCat.all(cat, per, page * per);
+          const c = audioDB._qCountCat.get(cat);
+          total = c ? c.n : rows.length;
         } else if (letter) {
           rows = audioDB._qBrowseLetter.all(letter + "%", per, page * per);
-          // count for this letter
           const c = audioDB.prepare("SELECT COUNT(*) AS n FROM audiobooks WHERE nt LIKE ?").get(letter + "%");
           total = c ? c.n : rows.length;
         } else {
@@ -1011,7 +1042,7 @@ function startServer() {
         totaltime: r.totaltime, sections: r.sections,
         url: r.url, hasAudio: true,
       }));
-      send(res, 200, { books, total, page, per, indexed: true }, true);
+      send(res, 200, { books, total, page, per, cat, indexed: true, hasCat: !!audioDB._hasCat }, true);
     },
     "/gutenberg-find": (q, res) => {
       const title = String(q.searchParams.get("title") || "").slice(0, 200).trim();
