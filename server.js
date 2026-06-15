@@ -566,8 +566,11 @@ function startServer() {
   async function tfetch(url, ms, opts) {
     const isCL = url.indexOf("courtlistener.com") !== -1;
     // CourtListener throttles by burst rate; on 429 wait (honoring Retry-After) and
-    // retry a couple of times before giving up. Other hosts fail fast as before.
+    // retry before giving up. A total time budget caps the stacked waits so a call
+    // can never blow past the caller's timeout. Other hosts fail fast as before.
     const maxTries = (opts && opts.retries != null) ? opts.retries : (isCL ? 3 : 1);
+    const budgetMs = (opts && opts.budgetMs != null) ? opts.budgetMs : (isCL ? 22000 : 0);
+    const started = Date.now();
     let lastErr = null;
     for (let attempt = 0; attempt < maxTries; attempt++) {
       const ctl = new AbortController();
@@ -577,10 +580,16 @@ function startServer() {
         if (CL_TOKEN && isCL) headers.Authorization = "Token " + CL_TOKEN;
         const r = await fetch(url, { signal: ctl.signal, headers });
         if (r.status === 429 && attempt < maxTries - 1) {
-          // respect Retry-After (seconds) if present, else exponential-ish backoff
+          // respect Retry-After (seconds) if present, else short escalating backoff
           const ra = parseInt(r.headers.get("retry-after") || "", 10);
-          const waitMs = (!isNaN(ra) && ra > 0) ? Math.min(ra * 1000, 8000)
-            : 1200 * (attempt + 1) + Math.floor(Math.random() * 400);
+          let waitMs = (!isNaN(ra) && ra > 0) ? ra * 1000
+            : 900 * (attempt + 1) + Math.floor(Math.random() * 300);
+          waitMs = Math.min(waitMs, 4000);
+          // only wait if there's room left in the budget; otherwise give up now
+          if (budgetMs && (Date.now() - started + waitMs) > budgetMs) {
+            clearTimeout(tm);
+            throw new Error("HTTP 429 " + url);
+          }
           clearTimeout(tm);
           await sleep(waitMs);
           continue;
@@ -702,7 +711,7 @@ function startServer() {
     // 1) opinions (case law)
     try {
       const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=o&order_by=score%20desc&q=" +
-        encodeURIComponent(qstr), 18000));
+        encodeURIComponent(qstr), 12000, { retries: 2, budgetMs: 9000 }));
       for (const r of (j.results || []).slice(0, 12)) {
         const op = (r.opinions && r.opinions[0]) || {};
         docs.push({
@@ -719,7 +728,7 @@ function startServer() {
     // 2) dockets (the lawsuits themselves)
     try {
       const j = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/search/?type=r&order_by=score%20desc&q=" +
-        encodeURIComponent(qstr), 18000));
+        encodeURIComponent(qstr), 12000, { retries: 2, budgetMs: 9000 }));
       for (const r of (j.results || []).slice(0, 8)) {
         const did = r.docket_id || r.id;
         if (!did) continue;
