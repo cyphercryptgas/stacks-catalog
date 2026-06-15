@@ -898,23 +898,28 @@ function startServer() {
     return { id, text: lines.join("\n").slice(0, 1200000), caseName };
   }
 
+  // govinfo's web pages are a JS app shell whose stripped HTML is just the site nav
+  // ("Skip to main content", "Browse A to Z", etc). If we ever scrape that, it is NOT
+  // law — detect it and reject so we never render the chrome as a statute.
+  function looksLikeGovinfoChrome(t) {
+    if (!t) return true;
+    const head = t.slice(0, 600).toLowerCase();
+    const markers = ["skip to main content", "browse a to z", "browse by", "committee",
+                     "metrics", "authentication", "govinfo is a service"];
+    let hits = 0;
+    for (const m of markers) if (head.indexOf(m) !== -1) hits++;
+    // the real law almost never starts with several of these nav words at once
+    return hits >= 2;
+  }
+
   async function lawStatute(id) {
     // id is a govinfo package or granule id (USCODE-.../CFR-.../PLAW-.../etc).
     const gid = String(id);
-    // derive the package id from the granule id
     let pkg = gid;
     const mTitle = gid.match(/^([A-Z]+-\d{4}(?:-\d{2}-\d{2})?(?:-title\d+(?:-vol\d+)?)?)/);
     if (mTitle) pkg = mTitle[1];
-
-    const isGranule = gid !== pkg; // we have a specific section/granule
-    // The GRANULE content file is the clean single-section text. The package-level
-    // files (api /htm and pkg/.../{pkg}.htm) return the ENTIRE title (megabytes),
-    // so only use those when we don't have a granule.
-    const tries = [];
-    if (isGranule) {
-      tries.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm");
-    }
-    tries.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm");
+    const isGranule = gid !== pkg;
+    const detail = "https://www.govinfo.gov/app/details/" + pkg + (isGranule ? "/" + gid : "");
 
     function clean(raw) {
       return raw.replace(/<head[\s\S]*?<\/head>/i, "")
@@ -928,25 +933,55 @@ function startServer() {
         .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     }
 
+    // 1) ask the govinfo API for the real downloadable content links. The package
+    //    (and granule) summary expose a `download` object with htm/txt URLs that
+    //    serve the actual text, not the web app shell.
+    const contentUrls = [];
+    if (GOVINFO_KEY) {
+      const summaryURLs = [];
+      if (isGranule) summaryURLs.push("https://api.govinfo.gov/packages/" + pkg + "/granules/" + gid +
+        "/summary?api_key=" + encodeURIComponent(GOVINFO_KEY));
+      summaryURLs.push("https://api.govinfo.gov/packages/" + pkg +
+        "/summary?api_key=" + encodeURIComponent(GOVINFO_KEY));
+      for (const su of summaryURLs) {
+        try {
+          const sm = JSON.parse(await tfetch(su, 14000, { retries: 1 }));
+          const dl = sm && sm.download ? sm.download : {};
+          for (const key of ["htm", "html", "txt", "xml"]) {
+            if (dl[key]) {
+              const u = dl[key].indexOf("api_key=") === -1
+                ? dl[key] + (dl[key].indexOf("?") === -1 ? "?" : "&") + "api_key=" + encodeURIComponent(GOVINFO_KEY)
+                : dl[key];
+              contentUrls.push(u);
+            }
+          }
+          if (contentUrls.length) break;
+        } catch (e) { /* try next summary */ }
+      }
+    }
+    // 2) fall back to the conventional content paths only if the API gave nothing
+    if (!contentUrls.length) {
+      if (isGranule) contentUrls.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + gid + ".htm");
+      contentUrls.push("https://www.govinfo.gov/content/pkg/" + pkg + "/html/" + pkg + ".htm");
+    }
+
     let txt = "";
-    for (const u of tries) {
+    for (const u of contentUrls) {
       try {
-        const raw = await tfetch(u, 18000);
+        const raw = await tfetch(u, 18000, { retries: 1 });
         if (!raw) continue;
-        // guard against the multi-megabyte whole-title dump leaking through
-        if (raw.length > 600000 && isGranule) continue;
+        if (raw.length > 900000 && isGranule) continue; // whole-title dump leaking through
         const c = clean(raw);
-        if (c && c.length > 60) { txt = c; break; }
+        if (!c || c.length < 80) continue;
+        if (looksLikeGovinfoChrome(c)) continue; // the site shell, not the law
+        txt = c; break;
       } catch (e) { /* try next */ }
     }
     if (!txt) {
-      const e = new Error("nohtml"); e.nohtml = true;
-      e.detail = "https://www.govinfo.gov/app/details/" + pkg +
-        (isGranule ? "/" + gid : "");
+      const e = new Error("nohtml"); e.nohtml = true; e.detail = detail;
       throw e;
     }
-    return { id: gid, text: txt.slice(0, 1200000),
-      detail: "https://www.govinfo.gov/app/details/" + pkg + (isGranule ? "/" + gid : "") };
+    return { id: gid, text: txt.slice(0, 1200000), detail };
   }
   function annexRoute(kind, q, res) {
     const qstr = String(q.searchParams.get("q") || "").trim().slice(0, 160);
@@ -955,8 +990,12 @@ function startServer() {
       if (!id) return send(res, 400, { error: "id required" }, true);
       const file = path.join(ANNEX_DIR, "statute-" + id + ".json");
       const hit = annexCache(file);
-      if (hit) return send(res, 200, hit);
-      return lawStatute(id).then((out) => { annexSave(file, out); send(res, 200, out); })
+      // ignore a poisoned cache entry that captured the govinfo site shell as "text"
+      if (hit && !(hit.text && looksLikeGovinfoChrome(hit.text))) return send(res, 200, hit);
+      return lawStatute(id).then((out) => {
+        if (out && out.text && !looksLikeGovinfoChrome(out.text)) annexSave(file, out);
+        send(res, 200, out);
+      })
         .catch((e) => e && e.nohtml
           ? send(res, 200, { id, text: "", detail: e.detail })
           : send(res, 502, { error: "statute fetch failed: " + e.message }, true));
@@ -998,8 +1037,15 @@ function startServer() {
   const routes = {
     "/wing/info": (q, res) => {
       const out = {};
-      for (const w of Object.keys(wings))
-        out[w] = { subjects: wings[w].subjects, built: wings[w].built, version: wings[w].version };
+      for (const w of Object.keys(wings)) {
+        let sc = {};
+        try {
+          const m = wings[w].db.prepare("SELECT v FROM meta WHERE k='subject_counts'").get();
+          if (m && m.v) sc = JSON.parse(m.v);
+        } catch (e) { sc = {}; }
+        out[w] = { subjects: wings[w].subjects, built: wings[w].built,
+                   version: wings[w].version, subject_counts: sc };
+      }
       send(res, 200, { wings: out });
     },
     "/wing/room": (q, res) => {
@@ -1092,6 +1138,44 @@ function startServer() {
         .catch((e) => send(res, 502, { error: "pg catalog lookup failed: " + e.message }, true));
     },
     "/health": (q, res) => send(res, 200, { ok: true }, true),
+    "/debug/wings": (q, res) => {
+      // diagnostics: for each open wing, report subjects, total works, and whether
+      // the room query actually returns rows for the first few subject indices.
+      const out = { wingsOpen: Object.keys(wings), perWing: {} };
+      for (const w of Object.keys(wings)) {
+        const info = { subjects: 0, subjectNames: [], worksCount: 0, hasSubjectCounts: false,
+                       roomProbe: [], distinctSi: 0 };
+        try {
+          const wg = wings[w];
+          info.subjects = (wg.subjects || []).length;
+          info.subjectNames = (wg.subjects || []).slice(0, 6);
+          try {
+            const c = wg.db.prepare("SELECT COUNT(*) AS n FROM works").get();
+            info.worksCount = c ? c.n : 0;
+          } catch (e) { info.worksError = e.message; }
+          // how many distinct si values actually have works rows?
+          try {
+            const d = wg.db.prepare("SELECT COUNT(DISTINCT si) AS n FROM works").get();
+            info.distinctSi = d ? d.n : 0;
+          } catch (e) { info.distinctSiError = e.message; }
+          // does meta carry subject_counts? (the /wing/info gap)
+          try {
+            const m = wg.db.prepare("SELECT v FROM meta WHERE k='subject_counts'").get();
+            info.hasSubjectCounts = !!(m && m.v && m.v !== "{}");
+          } catch (e) {}
+          // probe the actual room query for the first 3 subjects, depth 0
+          for (let si = 0; si < Math.min(3, info.subjects || 0); si++) {
+            try {
+              const rows = wg.qRoom.all(si, 0, ROOM_SIZE);
+              info.roomProbe.push({ si, rows: rows.length,
+                first: rows[0] ? (rows[0].title || "").slice(0, 40) : null });
+            } catch (e) { info.roomProbe.push({ si, error: e.message }); }
+          }
+        } catch (e) { info.error = e.message; }
+        out.perWing[w] = info;
+      }
+      send(res, 200, out, true);
+    },
     "/debug/law": (q, res) => {
       // diagnostics: is the bodies pre-cache populated? does a given id resolve?
       const out = { lawOpen: !!wings.law, hasBodies: false, bodyCount: 0, sampleIds: [], worksCount: 0 };
