@@ -34,6 +34,22 @@ TOKEN = os.environ.get("CL_TOKEN", "")
 PER_NOS = int(os.environ.get("PER_NOS", "640"))
 OUT = os.environ.get("OUT", "law.db")
 
+# Rate-limit awareness (same approach as build_wing_law.py): CourtListener's
+# free tier allows only ~50/hour, 125/day. REQUEST_BUDGET caps API calls per run
+# so we bank what we get and STOP cleanly instead of retry-grinding for ~30min
+# against the 50/hour wall (which is what made past runs take hours). Already-
+# filled docket halls are skipped, so re-running fills more halls across days.
+REQUEST_BUDGET = int(os.environ.get("REQUEST_BUDGET", "90"))
+_req_count = {"n": 0}
+
+
+class BudgetExhausted(Exception):
+    """Raised when the per-run API request budget is spent — stop cleanly."""
+
+
+class RateLimited(Exception):
+    """Raised when CourtListener returns 429 after a short retry — stop for today."""
+
 # PACER nature-of-suit groups -> one hall each. The query matches the suit
 # label as free text within type=r RECAP search, which is how the front end
 # groups them too.
@@ -60,6 +76,9 @@ NATURES = [
 
 
 def get(url, tries=5):
+    if _req_count["n"] >= REQUEST_BUDGET:
+        raise BudgetExhausted("hit REQUEST_BUDGET of %d calls" % REQUEST_BUDGET)
+    _req_count["n"] += 1
     last = None
     for attempt in range(tries):
         try:
@@ -78,8 +97,24 @@ def get(url, tries=5):
             last = "HTTP %s %s" % (e.code, body)
             if e.code in (400, 401, 403, 404):
                 raise RuntimeError("CourtListener rejected: " + last + "\n  " + url)
+            if e.code == 429:
+                # honor a SHORT Retry-After once (the 5/min limit clears fast),
+                # but never wait on the 50/hour wall (~1800s) — bank progress and
+                # stop the run so we don't burn 30+ minutes sleeping.
+                ra = 0
+                try:
+                    ra = int(e.headers.get("Retry-After") or 0)
+                except Exception:  # noqa: BLE001
+                    ra = 0
+                if attempt == 0 and 0 < ra <= 30:
+                    print("  429 (5/min); waiting %ds once" % ra, flush=True)
+                    time.sleep(ra)
+                    continue
+                raise RateLimited(last)
             print("  retry %d after %s" % (attempt + 1, last), flush=True)
             time.sleep(4.0 * (attempt + 1))
+        except (BudgetExhausted, RateLimited):
+            raise
         except Exception as e:  # noqa: BLE001
             last = str(e)
             if attempt == tries - 1:
@@ -90,7 +125,12 @@ def get(url, tries=5):
 
 
 def dockets_for(nature, cap):
-    """Most-relevant dockets for a nature-of-suit, via type=r RECAP search."""
+    """Most-relevant dockets for a nature-of-suit, via type=r RECAP search.
+
+    Returns (rows, stop) where stop is a BudgetExhausted/RateLimited instance if
+    the run should halt after banking these rows, else None. Rows gathered before
+    a stop are complete and safe to shelve.
+    """
     rows = []
     url = (BASE + "/api/rest/v4/search/?type=r&order_by=" +
            urllib.parse.quote("score desc") +
@@ -98,7 +138,10 @@ def dockets_for(nature, cap):
            "&q=" + urllib.parse.quote(nature))
     pause = 0.3 if TOKEN else 1.0
     while len(rows) < cap and url:
-        j = get(url)
+        try:
+            j = get(url)
+        except (BudgetExhausted, RateLimited) as e:
+            return rows, e  # bank what we have, signal halt
         results = j.get("results") or []
         if not results:
             break
@@ -118,7 +161,7 @@ def dockets_for(nature, cap):
                          year, (BASE + url_abs) if url_abs.startswith("/") else (url_abs or None)))
         url = j.get("next")
         time.sleep(pause)
-    return rows
+    return rows, None
 
 
 def main():
@@ -137,28 +180,42 @@ def main():
     for nature, label_h in NATURES:
         si = next_si
         label = "dockets \u00b7 " + label_h.lower()
+    FILLED_MIN = int(os.environ.get("FILLED_MIN", "1"))
+    stopped = None
+    filled_this_run = 0
+    for nature, label_h in NATURES:
+        si = next_si
+        label = "dockets \u00b7 " + label_h.lower()
         n_have = cur.execute("SELECT COUNT(*) FROM works WHERE si=?", (si,)).fetchone()[0]
-        if n_have >= 1 and si < len(subjects) and subjects[si] == label:
-            print("hall %2d %-40s present (%d)" % (si, label[:40], n_have), flush=True)
+        if n_have >= FILLED_MIN and si < len(subjects) and subjects[si] == label:
+            print("hall %2d %-40s present (%d) — skipping" % (si, label[:40], n_have), flush=True)
             next_si += 1
             continue
-        try:
-            ds = dockets_for(nature, PER_NOS)
-        except Exception as e:  # noqa: BLE001
-            print("hall %2d %-40s ERROR %s" % (si, label[:40], e), flush=True)
-            ds = []
-        # id field carries "recap:<docket_id>" so the reader knows it's a docket
-        rows = [(si, rank, "recap:" + did, case, court, year, 0, None, url_abs)
-                for rank, (did, case, court, year, url_abs) in enumerate(ds)]
-        cur.execute("DELETE FROM works WHERE si=?", (si,))
-        cur.executemany("INSERT OR REPLACE INTO works VALUES(?,?,?,?,?,?,?,?,?)", rows)
-        con.commit()
-        if si < len(subjects):
-            subjects[si] = label
+        ds, stop = dockets_for(nature, PER_NOS)
+        # id field carries "recap:<docket_id>" so the reader knows it's a docket.
+        # Only replace the hall's rows if we actually gathered some — never
+        # delete-then-leave-empty (that was corrupting halls on a 429).
+        if ds:
+            rows = [(si, rank, "recap:" + did, case, court, year, 0, None, url_abs)
+                    for rank, (did, case, court, year, url_abs) in enumerate(ds)]
+            cur.execute("DELETE FROM works WHERE si=?", (si,))
+            cur.executemany("INSERT OR REPLACE INTO works VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            con.commit()
+            if si < len(subjects):
+                subjects[si] = label
+            else:
+                subjects.append(label)
+            filled_this_run += 1
+            print("hall %2d %-40s shelved %d (requests used: %d/%d)"
+                  % (si, label[:40], len(rows), _req_count["n"], REQUEST_BUDGET), flush=True)
         else:
-            subjects.append(label)
-        print("hall %2d %-40s shelved %d" % (si, label[:40], len(rows)), flush=True)
+            print("hall %2d %-40s no data (left existing %d intact)"
+                  % (si, label[:40], n_have), flush=True)
         next_si += 1
+        if stop is not None:
+            stopped = stop
+            print("  -> stopping run: %s" % stop, flush=True)
+            break
         time.sleep(0.2)
 
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
@@ -172,9 +229,23 @@ def main():
         cur.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (kk, vv))
     con.commit()
     total = cur.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+    # how many docket halls still need filling, so the operator knows to re-run.
+    # docket halls occupy the last len(NATURES) subject slots.
+    first_docket_si = max(0, len(subjects) - len(NATURES))
+    remaining = 0
+    for k in range(len(NATURES)):
+        c = cur.execute("SELECT COUNT(*) FROM works WHERE si=?",
+                        (first_docket_si + k,)).fetchone()[0]
+        if c < FILLED_MIN:
+            remaining += 1
     con.execute("PRAGMA optimize")
     con.close()
     print("law wing now: %d rows across %d halls -> %s" % (total, len(subjects), OUT))
+    print("run summary: filled %d docket hall(s) this run, used %d/%d requests; %d still empty"
+          % (filled_this_run, _req_count["n"], REQUEST_BUDGET, remaining), flush=True)
+    if stopped is not None or remaining:
+        print("  -> run this step again (another hour/day for the 50/hour limit) "
+              "to fill the remaining docket hall(s). filled halls are skipped.", flush=True)
     return 0
 
 
