@@ -23,6 +23,10 @@ on:
       per_nos:
         description: "Dockets per case-type hall (RECAP)"
         default: "640"
+      quick_law:
+        description: "Quick law run: fill courts+dockets only, skip research/statutes/audio (extends the published law.db)"
+        type: boolean
+        default: false
   schedule:
     - cron: "20 7 3 * *" # monthly, the 3rd at 07:20 UTC
 
@@ -45,9 +49,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      # QUICK LAW MODE: pull the already-published law.db so the court/docket
+      # steps EXTEND it (statutes/CFR/dockets already in it are preserved). Without
+      # this, the runner starts empty and a court-only run would publish a law.db
+      # missing all statutes — wiping them from the live site.
+      - name: Download published law.db (quick mode)
+        if: ${{ inputs.quick_law == true }}
+        env:
+          TAG: catalog-index
+        run: |
+          set -e
+          if gh release download "$TAG" -p law.db.gz -O law.db.gz; then
+            gunzip -f law.db.gz
+            echo "extending published law.db ($(du -h law.db | cut -f1))"
+          else
+            echo "no published law.db yet — quick mode will build courts fresh."
+          fi
+
       - name: Build research wing (OpenAlex)
         id: research
-        if: ${{ github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research' }}
+        if: ${{ inputs.quick_law != true && (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research') }}
         continue-on-error: true
         env:
           PER_FIELD: ${{ inputs.per_field || '10240' }}
@@ -57,7 +78,7 @@ jobs:
 
       - name: Append research books (OpenStax + DOAB)
         id: research_books
-        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research') && steps.research.outcome == 'success' }}
+        if: ${{ inputs.quick_law != true && (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'research') && steps.research.outcome == 'success' }}
         continue-on-error: true
         env:
           PER_SUBJECT: ${{ inputs.per_subject || '640' }}
@@ -66,7 +87,7 @@ jobs:
 
       - name: Build law library (CourtListener)
         id: law
-        if: ${{ github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law' }}
+        if: ${{ inputs.quick_law == true || github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law' }}
         continue-on-error: true
         env:
           PER_COURT: ${{ inputs.per_court || '2560' }}
@@ -76,7 +97,7 @@ jobs:
 
       - name: Append law statutes (U.S. Code + CFR)
         id: law_statutes
-        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
+        if: ${{ inputs.quick_law != true && (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
         continue-on-error: true
         env:
           PER_TITLE: ${{ inputs.per_title || '1920' }}
@@ -86,7 +107,7 @@ jobs:
 
       - name: Append RECAP dockets (federal cases by type)
         id: law_dockets
-        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
+        if: ${{ (inputs.quick_law == true || github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' }}
         continue-on-error: true
         env:
           PER_NOS: ${{ inputs.per_nos || '640' }}
@@ -96,6 +117,7 @@ jobs:
 
       - name: Build LibriVox audiobook index
         id: audio
+        if: ${{ inputs.quick_law != true }}
         continue-on-error: true
         env:
           LV_PAUSE: "4"
