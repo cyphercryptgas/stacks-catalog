@@ -23,9 +23,6 @@ on:
       per_nos:
         description: "Dockets per case-type hall (RECAP)"
         default: "640"
-      precache_clusters:
-        description: "Famous opinions to pre-cache from bulk data (0 to skip)"
-        default: "50000"
   schedule:
     - cron: "20 7 3 * *" # monthly, the 3rd at 07:20 UTC
 
@@ -96,16 +93,6 @@ jobs:
           CL_TOKEN: ${{ secrets.CL_TOKEN }}
           OUT: law.db
         run: python scripts/append_law_dockets.py
-
-      - name: Pre-cache famous opinions from bulk data (no API limit)
-        id: law_precache
-        if: ${{ (github.event_name == 'schedule' || inputs.wing == 'both' || inputs.wing == 'law') && steps.law.outcome == 'success' && (inputs.precache_clusters || '50000') != '0' }}
-        continue-on-error: true
-        env:
-          AUTO_DISCOVER: "1"
-          TARGET_CLUSTERS: ${{ inputs.precache_clusters || '50000' }}
-          OUT: law.db
-        run: python scripts/build_law_precache_bulk.py
 
       - name: Build LibriVox audiobook index
         id: audio
