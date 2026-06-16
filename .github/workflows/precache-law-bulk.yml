@@ -1,0 +1,101 @@
+name: precache-law-bulk
+
+# One-time (or occasional) heavy job: pre-cache the full TEXT of the most-cited
+# court opinions from CourtListener's public bulk data on S3 (no API rate limit).
+# It runs SEPARATELY from build-wings.yml because it streams the entire ~10M-row
+# bulk dataset and can take hours — keeping it out of the wing build means a slow
+# precache can never time out the (fast) wing builds, and the wing build always
+# publishes. This job DOWNLOADS the already-published law.db, adds the `bodies`
+# table to it, and RE-PUBLISHES — it never rebuilds law.db from scratch, so the
+# courts / statutes / dockets shelved by build-wings.yml are preserved.
+#
+# Run it manually from the Actions tab when you want to (re)load opinion text.
+# Once the bodies are cached they live in law.db permanently; you do not need to
+# run this regularly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      precache_clusters:
+        description: "Famous opinions to pre-cache from bulk data"
+        default: "50000"
+      min_cites:
+        description: "Skip opinions with fewer than this many citations"
+        default: "1"
+
+permissions:
+  contents: write
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
+jobs:
+  precache:
+    runs-on: ubuntu-latest
+    # its own generous ceiling — this is the long one, on its own clock.
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: catalog-index
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 1) pull the CURRENTLY PUBLISHED law.db so we extend it (never rebuild it).
+      - name: Download published law.db
+        run: |
+          set -e
+          if gh release download "$TAG" -p law.db.gz -O law.db.gz; then
+            gunzip -f law.db.gz
+            echo "got published law.db ($(du -h law.db | cut -f1))"
+            python - <<'PY'
+          import sqlite3
+          c = sqlite3.connect("law.db")
+          try:
+              w = c.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+              print("law.db has", w, "works rows (courts/statutes/dockets) — will be preserved")
+          except Exception as e:
+              print("WARNING: downloaded law.db has no works table:", e)
+          c.close()
+          PY
+          else
+            echo "no published law.db found — precache will create a bodies-only db."
+            echo "(this is fine, but ideally run build-wings law first so works exist.)"
+          fi
+
+      # 2) the heavy part: stream bulk data, fill the bodies table in law.db.
+      - name: Pre-cache famous opinions from bulk data (no API limit)
+        env:
+          AUTO_DISCOVER: "1"
+          TARGET_CLUSTERS: ${{ inputs.precache_clusters || '50000' }}
+          MIN_CITES: ${{ inputs.min_cites || '1' }}
+          OUT: law.db
+        run: python scripts/build_law_precache_bulk.py
+
+      # 3) re-publish law.db (now with bodies) back to the same release, updating
+      #    the wings.json manifest so the live server picks up the new version.
+      - name: Re-publish law.db with cached bodies
+        run: |
+          set -e
+          if [ ! -f law.db ] || [ "$(stat -c%s law.db)" -lt 4096 ]; then
+            echo "law.db missing/empty after precache — nothing to publish."; exit 1
+          fi
+          gh release download "$TAG" -p wings.json -O wings.json || echo '{}' > wings.json
+          STAMP="$(date -u +%Y%m%d-%H%M)"
+          python - "$STAMP" <<'PY'
+          import gzip, json, os, shutil, sys
+          stamp = sys.argv[1]
+          try:
+              wings = json.load(open("wings.json"))
+          except Exception:
+              wings = {}
+          with open("law.db", "rb") as f, gzip.open("law.db.gz", "wb", compresslevel=6) as g:
+              shutil.copyfileobj(f, g)
+          wings["law"] = {"asset": "law.db.gz", "version": stamp}
+          json.dump(wings, open("wings.json", "w"), indent=1)
+          print("law.db.gz", os.path.getsize("law.db.gz") // 1048576, "MB gz; version", stamp)
+          PY
+          gh release upload "$TAG" law.db.gz wings.json --clobber
+          echo "re-published law.db with cached opinion bodies."
