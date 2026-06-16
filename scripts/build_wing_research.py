@@ -127,7 +127,13 @@ def main():
         print("hall %2d %-28s shelved %d" % (si, subjects[si], rank), flush=True)
 
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
+    # per-subject title counts (si -> subject name) for the directory's counts/hiding
+    counts = {}
+    for si, cnt in con.execute("SELECT si, COUNT(*) FROM works GROUP BY si").fetchall():
+        if 0 <= si < len(subjects):
+            counts[subjects[si]] = cnt
     for k, v in (("kind", "research"), ("subjects", json.dumps(subjects)),
+                 ("subject_counts", json.dumps(counts)),
                  ("built", version[:8]), ("version", version)):
         con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (k, v))
     con.commit()
