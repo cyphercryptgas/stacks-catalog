@@ -165,7 +165,11 @@ def main():
     # how many rows count as "already filled enough" to skip on a later run.
     # a court with at least this many rows is left untouched so each run spends
     # its budget on the still-empty courts (forward progress across days).
-    FILLED_MIN = int(os.environ.get("FILLED_MIN", str(min(PER_COURT, 200))))
+    # NOTE: on the free tier the 5/min throttle stops a court at ~100 cases per
+    # run, so this MUST be <= ~100 or under-filled courts get re-fetched forever
+    # and the builder never advances. 50 = "has a real shelf of landmark cases,
+    # move on". Raise it (and pause through throttles) only with a paid token.
+    FILLED_MIN = int(os.environ.get("FILLED_MIN", str(min(PER_COURT, 50))))
     stopped_early = False
     filled_this_run = 0
     for si, (cid, label) in enumerate(COURTS):
