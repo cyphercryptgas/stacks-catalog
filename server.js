@@ -1158,6 +1158,13 @@ function startServer() {
             const d = wg.db.prepare("SELECT COUNT(DISTINCT si) AS n FROM works").get();
             info.distinctSi = d ? d.n : 0;
           } catch (e) { info.distinctSiError = e.message; }
+          // CRITICAL: which si values actually hold rows? (catches si-offset bugs)
+          try {
+            const r = wg.db.prepare("SELECT MIN(si) AS lo, MAX(si) AS hi FROM works").get();
+            info.siRange = r ? { min: r.lo, max: r.hi } : null;
+            info.siWithRows = wg.db.prepare(
+              "SELECT DISTINCT si FROM works ORDER BY si LIMIT 12").all().map((x) => x.si);
+          } catch (e) { info.siRangeError = e.message; }
           // does meta carry subject_counts? (the /wing/info gap)
           try {
             const m = wg.db.prepare("SELECT v FROM meta WHERE k='subject_counts'").get();
