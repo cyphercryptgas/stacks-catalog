@@ -243,7 +243,12 @@ def main():
             time.sleep(0.2)
 
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
+    sc = {}
+    for si, cnt in cur.execute("SELECT si, COUNT(*) FROM works GROUP BY si").fetchall():
+        if 0 <= si < len(subjects):
+            sc[subjects[si]] = cnt
     for kk, vv in (("subjects", json.dumps(subjects)),
+                   ("subject_counts", json.dumps(sc)),
                    ("built", version[:8]), ("version", version)):
         cur.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (kk, vv))
     con.commit()
