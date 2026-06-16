@@ -230,13 +230,19 @@ def main():
     con.commit()
     total = cur.execute("SELECT COUNT(*) FROM works").fetchone()[0]
     # how many docket halls still need filling, so the operator knows to re-run.
-    # docket halls occupy the last len(NATURES) subject slots.
-    first_docket_si = max(0, len(subjects) - len(NATURES))
+    # count by LABEL (subjects starting "dockets ·") rather than guessing the si
+    # offset — the docket halls sit after courts+statutes+cfr+public-laws, so an
+    # arithmetic offset lands on the wrong halls.
     remaining = 0
-    for k in range(len(NATURES)):
-        c = cur.execute("SELECT COUNT(*) FROM works WHERE si=?",
-                        (first_docket_si + k,)).fetchone()[0]
-        if c < FILLED_MIN:
+    for sidx, subj in enumerate(subjects):
+        if isinstance(subj, str) and subj.startswith("dockets \u00b7"):
+            c = cur.execute("SELECT COUNT(*) FROM works WHERE si=?", (sidx,)).fetchone()[0]
+            if c < FILLED_MIN:
+                remaining += 1
+    # also count docket halls not yet in subjects at all (never reached this run)
+    filled_labels = {s for s in subjects if isinstance(s, str) and s.startswith("dockets \u00b7")}
+    for _, label_h in NATURES:
+        if ("dockets \u00b7 " + label_h.lower()) not in filled_labels:
             remaining += 1
     con.execute("PRAGMA optimize")
     con.close()
