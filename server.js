@@ -139,7 +139,10 @@ function startServer() {
     const p = path.join(DATA_DIR, w + ".db");
     if (!fs.existsSync(p)) continue;
     try {
-      const wdb = new DatabaseSync(p, { readOnly: true });
+      // law opens writable so live-fetched opinions can be lazily cached into
+      // its bodies table (an ephemeral runtime cache — resets on redeploy, like
+      // Gutenberg's). Other wings stay read-only.
+      const wdb = new DatabaseSync(p, { readOnly: w !== "law" });
       const wm = Object.fromEntries(
         wdb.prepare("SELECT k, v FROM meta").all().map((r) => [r.k, r.v]));
       wings[w] = {
@@ -153,6 +156,15 @@ function startServer() {
       try {
         wings[w].qBody = wdb.prepare("SELECT text FROM bodies WHERE id = ?");
       } catch (e) { wings[w].qBody = null; }
+      // lazy write-back: cache opinion text fetched live, so a popular case that
+      // wasn't in the bulk pre-cache is stored after its first read (same idea as
+      // the Gutenberg on-disk cache). Best-effort; never blocks a read.
+      if (w === "law") {
+        try {
+          wdb.prepare("CREATE TABLE IF NOT EXISTS bodies(id TEXT PRIMARY KEY, text TEXT)").run();
+          wings[w].qBodyPut = wdb.prepare("INSERT OR REPLACE INTO bodies VALUES(?, ?)");
+        } catch (e) { wings[w].qBodyPut = null; }
+      }
       console.log("wing open: " + w + " \u2014 " + wings[w].subjects.length + " halls");
     } catch (e) {
       console.log("wing " + w + " failed to open: " + e.message);
@@ -836,7 +848,15 @@ function startServer() {
         throw new Error("opinion " + id + " unavailable (" + (e1.message || e2.message) + ")");
       }
     }
-    return { id, text: (text || "").slice(0, 1200000) };
+    const finalText = (text || "").slice(0, 1200000);
+    // lazy-cache a successful live fetch so the next read is instant (no rate limit)
+    if (finalText) {
+      try {
+        const lw = wings.law;
+        if (lw && lw.qBodyPut) lw.qBodyPut.run(String(id), finalText);
+      } catch (e) { /* cache write is best-effort; never fail the read */ }
+    }
+    return { id, text: finalText };
   }
   async function lawDocket(id) {
     const dj = JSON.parse(await tfetch(CL_BASE + "/api/rest/v4/dockets/" + id + "/?format=json", 20000));
